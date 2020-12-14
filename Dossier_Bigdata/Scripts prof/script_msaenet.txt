@@ -1,0 +1,104 @@
+# Script for msaenet package
+# Multi-Step Adaptive Estimation Methods for Sparse Regressions
+# Ref: Xiao N. and Xu Q-S. (2015). Multi-step adaptive elastic-net: reducing false positives in high-dimensional variable selection. 
+#	Journal of Statistical Computation and Simulation, 85(18), 3755–3765.
+
+library(readxl)
+library(tidyverse)
+library(msaenet)
+library(glmnet)
+
+dlbase <- read_excel("c:\\R\\data\\dlbase.xlsx", sheet = "dlbase")
+dlbase <- data.frame(dlbase) 
+
+training_dlbase <- dlbase
+data.frame(training_dlbase)
+
+# standardized y and x (centered and standardized): ipiman - cl1
+y <- data.frame(training_dlbase) %>%
+  select(WTI) %>%
+  scale(center = T, scale = F) %>%
+  as.matrix()
+
+x <- data.frame(training_dlbase) %>%
+  select(-WTI) %>% # on retire la variable à expliquer y
+  as.matrix()
+
+
+## adaptive EN
+# Choose alpha sequencially with 0 < alpha < 1
+a <- seq(0.1, 0.9, 0.05)
+aenet.fit <- aenet(x, y, family = "gaussian", init = "enet", alphas = a, tune = "cv", nfolds = 10, seed = 1001)
+print(aenet.fit)
+coef(aenet.fit)
+aenet.fit$beta	
+which(! coef(aenet.fit) == 0, arr.ind = TRUE)	# Get the name of relevant variables
+
+msaenet.nzv(aenet.fit)		# Get Indices of Non-Zero Variables
+msaenet.fp(aenet.fit, 1:5)	# Get the Number of False Positive Selections
+msaenet.tp(aenet.fit, 1:5)	# Get the Number of True Positive Selections
+
+#----------------------------------------------------------------------------
+## Adaptive MCP-Net
+a <- seq(0.1, 0.9, 0.05)
+amnet.fit <- amnet(x, y, family = "gaussian", init = "mnet", alphas = a, tune = "cv", nfolds = 10, seed = 1001)
+print(amnet.fit)
+coef(amnet.fit)
+amnet.fit$beta	
+which(! coef(amnet.fit) == 0, arr.ind = TRUE)	# Get the name of relevant variables
+
+msaenet.nzv(amnet.fit)		# Get Indices of Non-Zero Variables
+msaenet.fp(amnet.fit, 1:5)	# Get the Number of False Positive Selections
+msaenet.tp(amnet.fit, 1:5)	# Get the Number of True Positive Selections
+
+#----------------------------------------------------------------------------
+## Adaptive SCAD-Net
+a <- seq(0.1, 0.9, 0.05)
+asnet.fit <- asnet(x, y, family = "gaussian", init = "snet", alphas = a, tune = "cv", nfolds = 10, seed = 1001)
+print(asnet.fit)
+coef(asnet.fit)
+asnet.fit$beta	
+which(! coef(asnet.fit) == 0, arr.ind = TRUE)	# Get the name of relevant variables
+
+msaenet.nzv(asnet.fit)		# Get Indices of Non-Zero Variables
+msaenet.fp(asnet.fit, 1:5)	# Get the Number of False Positive Selections
+msaenet.tp(asnet.fit, 1:5)	# Get the Number of True Positive Selections
+
+#----------------------------------------------------------------------------
+## Multi-Step Adaptive Elastic-Net
+a <- seq(0.1, 0.9, 0.05)
+msaenet.fit <- msaenet(x, y, family = "gaussian", init = "enet", alphas = a, tune = "cv", nfolds = 10, seed = 1001)
+print(msaenet.fit)
+coef(msaenet.fit)
+msaenet.fit$beta	
+which(! coef(msaenet.fit) == 0, arr.ind = TRUE)	# Get the name of relevant variables
+
+msaenet.nzv(msaenet.fit)		# Get Indices of Non-Zero Variables
+msaenet.fp(msaenet.fit, 1:5)	# Get the Number of False Positive Selections
+msaenet.tp(msaenet.fit, 1:5)	# Get the Number of True Positive Selections
+
+#----------------------------------------------------------------------------
+## Multi-Step Adaptive MCP-Net
+a <- seq(0.1, 0.9, 0.05)
+msamnet.fit <- msamnet(x, y, family = "gaussian", init = "mnet", alphas = a, tune = "cv", nfolds = 10, seed = 1001)
+print(msamnet.fit)
+coef(msamnet.fit)
+msamnet.fit$beta	
+which(! coef(msamnet.fit) == 0, arr.ind = TRUE)	# Get the name of relevant variables
+
+msaenet.nzv(msamnet.fit)		# Get Indices of Non-Zero Variables
+msaenet.fp(msamnet.fit, 1:5)	# Get the Number of False Positive Selections
+msaenet.tp(msamnet.fit, 1:5)	# Get the Number of True Positive Selections
+
+#----------------------------------------------------------------------------
+## Multi-Step Adaptive SCAD-Net
+a <- seq(0.1, 0.9, 0.05)
+msasnet.fit <- msasnet(x, y, family = "gaussian", init = "snet", alphas = a, tune = "cv", nfolds = 10, seed = 1001)
+print(msasnet.fit)
+coef(msasnet.fit)
+msasnet.fit$beta	
+which(! coef(msasnet.fit) == 0, arr.ind = TRUE)	# Get the name of relevant variables
+
+msaenet.nzv(msasnet.fit)		# Get Indices of Non-Zero Variables
+msaenet.fp(msasnet.fit, 1:5)	# Get the Number of False Positive Selections
+msaenet.tp(msasnet.fit, 1:5)	# Get the Number of True Positive Selections

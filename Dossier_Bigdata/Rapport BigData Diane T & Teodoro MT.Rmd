@@ -1,0 +1,1674 @@
+---
+title: "Prévisions du Baltic Dry Index et méthodes de sélection de variables"
+author: "Diane THIERRY et Teodoro MOUNIER TEBAS"
+date: "`r Sys.Date()`"
+output:
+  html_document: 
+    theme: readable
+    highlight: textmate
+    toc: yes
+    toc_float: yes
+---
+
+<style> body {text-align: justify} </style> <!-- Justify text. -->
+
+<br>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE,
+#fig.width = 7, fig.height = 7,
+#out.width = 7, out.height = 7,
+collapse = TRUE,  fig.show = "hold", out.width = "75%", fig.align = "center")
+```
+
+
+```{r include=FALSE}
+ # Library #
+library(readxl)
+library(tidyverse)
+library(lgarch)
+library(gets)
+library(glmnet)
+library(rbridge)
+library(doParallel)
+registerDoParallel(cores=4)
+library(ggplot2)
+library(purrr)
+library(tseries)
+library(forecast)
+library(dplyr)
+library(gridExtra)
+library(dyn)
+library(ncvreg)
+library(car)
+library(knitr)
+library(here)
+```
+
+```{r echo=FALSE, fig.height=5, fig.width=5, , fig.align='center'}
+knitr::include_graphics(here::here("./image/porteconteneur.jpg"))
+```
+
+<br>
+
+# Sommaire
+
+ * Introduction
+ * Analyses exploratoire et descriptive
+ * Sélection des variables
+ * Modèles de régression
+ * Annexes
+
+<br> 
+ 
+# 1. Introduction
+
+<br>
+
+La grande quantité d'informations créées et collectées chaque jour présente de nombreux avantages d'un point de vue statistique et analytique, mais peut parfois être un inconvénient dans le sens où toutes les données ne sont pas pertinentes dans l'étude d'un phénomène. Le développement des données massives (Big Data), a donc été accompagné par l'essor de nouvelles méthodes de sélection de variables qui visent à identifier les informations pertinentes de celles redondantes ou inutiles. En effet, un modèle est considéré comme explicite, interprétable lorsqu'il est parcimonieux et contient 4-5 variables qui pourront alors être interprétées librement.
+
+La quantité de méthodes de sélection de variables est elle aussi importante, et l'objectif de ce dossier est d'en expérimenter certaines dans le but d'appliquer une modélisation par les Moindres Carrés Ordinaires (MCO), la plus parcimonieuse possible. Notre objectif est d'expliquer le cours du Baltic Dry Index (BDI) entre février 2007 et décembre 2018, avec des données mensuelles. Le BDI est un indice couvrant le coût du fret maritime ; il fournit pour cela une évaluation du prix à payer pour transporter par voie de mer différentes matières premières spécifiques telles que le charbon, les céréales ou les minerais. 
+
+
+<br>
+
+-------------------
+# 2. Analyses exploratoire
+
+
+Commençons dans une première partie par explorer nos données pour les comprendre puis appliquer certaines modifications pour les rendre exploitables pour la suite de l'analyse. 
+
+<br>
+
+## 2.1 Importation
+
+
+```{r echo=TRUE}
+# Import des données
+library(readxl)
+df <- read_excel("./Données/database project fret.xlsx")
+df <- data.frame(df)
+```
+
+```{r include=FALSE}
+    #manips de base
+#summary(df)
+#dim(df) #153
+#str(df)
+df_fret <- na.omit(df)
+df_fret$Date <- as.Date(df_fret$Date)
+#dim(df_fret) #144
+#summary(df_fret)
+#names(df_fret)
+```
+
+Ainsi importée notre base contient `r nrow(df)` lignes et `r ncol(df_fret)` colonnes dont une de temps avec les dates, une de la variable à expliquer et `r ncol(df_fret)-2` variables explicatives. De manière à rendre la base exploitable pour l'analyse nous retirons les valeurs manquantes, et nous mettons le bon format à la variable de temps. 
+
+<br>
+
+## 2.2 Analyse de la stationnarité
+
+Nous analysons à présent la stationnarité des variables puisque celle-ci est nécessaire pour l'application des futures méthodes : elle implique que la série soit indépendante du temps, c'est à dire avec une même espérance mathématique et une même variance pour chaque observation. Nous utiliserons le test *Augmented Dickey-Fuller* (ADF) qui suit la règle de décision suivante :
+
+* $H_0$ : existence d'une racine unitaire, la série n'est pas stationnaire
+* $H_1$ : la série est stationnaire
+
+```{r echo=TRUE}
+# on met en série temporelle
+library(tseries)
+ts_fret <- ts(data = df_fret[,2:29], start=c(2007,01,01),frequency=12)
+
+pvalue <- 0
+for (i in 1:ncol(ts_fret)){
+  pvalue[i] <- adf.test(ts_fret[,i])$p.value }
+test_ADF <- as.data.frame(pvalue)
+
+resultat <- 0   # Oui stationnaire
+for (i in 1:nrow(test_ADF)){
+  if (test_ADF[i,"pvalue"]<0.05)
+    resultat[i] <- "Oui"
+  else
+    resultat[i] <- "Non"
+}
+test_ADF <- round(test_ADF,3)
+test_ADF <- cbind(test_ADF,resultat)
+rownames(test_ADF) <- paste(colnames(ts_fret))
+
+# On affiche les résultats du test
+test_ADF <- data.frame(test_ADF)
+DT::datatable(test_ADF)
+```
+
+Par la sortie du test on voit que seules `r length(test_ADF$resultat[test_ADF$resultat=="Oui"])` variables sont considérées stationnaires sur `r nrow(test_ADF)`. Cependant, comme visible sur le graphique ci-dessous où nous regardons l'évolution d'une variable prise aléatoirement, malgré le fait que le test ADF la considère stationnaire, nous voyons que ses fluctuations ne sont pas indépendantes du temps. Par précaution, nous decidons donc de stationnariser **toutes** les variables de notre base via une fonction *lag* qui les différencie toutes une fois (excepté la date) :
+
+```{r eval=TRUE, echo=FALSE, fig.width=15}
+library(plotly)
+plot_ly(data=df_fret, x = ~Date , y = ~Container.Index, mode = 'lines')
+```
+
+```{r echo=TRUE}
+# différenciation en passant par le lag
+df_fret[,2:29] <- df_fret[,2:29] %>% mutate(df_fret[,2:29] - lag(df_fret[,2:29]))
+df_fret <- na.omit(df_fret)
+```
+
+<br>
+
+## 2.3 Analyse des outliers
+
+Nous continuons notre démarche de manipulations des données dans le but de les rendre exploitables, en identifiant et retirant les observations atypiques de la base. Certaines valeurs sont effectivement considérées comme atypiques, aberrantes par leur forte ou très faible valeur : il est important de les déceler car elles peuvent biaiser l'analyse. La moyenne et la médiane en sont de bons exemples ; une forte valeur va tirer la moyenne vers le haut tandis que la véritable valeur pour laquelle 50% de l'échantillon a plus et 50% a moins, sera plus faible car non influencée par cet outlier. En séries temporelles, ces derniers sont le plus souvent liés à des chocs exogènes tels que guerres, crises, ou encore changements politiques. 
+
+Selon la nature de la variable à laquelle nous souhaitons retirer les points atypiques la méthode diffère, nous distinguons donc 2 méthodes : une pour les indices financiers et l'autre pour les variables temporelles non financières. 
+
+<br>
+
+**a) Pour les indices**
+
+```{r echo=TRUE}
+ts_fret <- ts(data = df_fret[,2:29], start=c(2007,01,01),frequency=12)
+    # sur indice financier 
+library(robustbase)
+library(PerformanceAnalytics)
+df_clean1 <- Return.clean(ts_fret[,c(1,2,4,5,7,11,15,16,26,27,28)], method = "boudt")
+```
+
+<br>
+
+**b) Pour les autres**
+
+```{r echo=TRUE}
+library(tsoutliers)
+df_clean2<-data.frame()
+
+a <- df_fret[,-c(1,2,3,5,6,8,12,16,17,27,28,29)]
+j<-0
+for (n in names(a)){
+  y<-ts(a[,c(as.character(n))])
+  fit<-tso(y)
+  i<-fit$yadj
+  if(j==0){df_clean2<-i} else{df_clean2<-data.frame(df_clean2,i)}
+  j<-j+1
+}
+names(df_clean2)<-names(a)
+```
+
+```{r include=FALSE}
+#On passe en numérique les variables car elles étaient en Time series
+df_clean2 <- as.data.frame(df_clean2)
+df_clean2$Crude.Oil.Prices..Brent. <- as.numeric(df_clean2$Crude.Oil.Prices..Brent.)
+df_clean2$world.trade..volume. <- as.numeric(df_clean2$world.trade..volume.)
+df_clean2$Business_Tendency_Surveys<- as.numeric(df_clean2$Business_Tendency_Surveys)
+df_clean2$Capacity_Utilization<- as.numeric(df_clean2$Capacity_Utilization)
+df_clean2$Consumer_Sentiment<- as.numeric(df_clean2$Consumer_Sentiment)
+df_clean2$GISS_Temperature<- as.numeric(df_clean2$GISS_Temperature)
+df_clean2$GEPU_current<- as.numeric(df_clean2$GEPU_current)
+df_clean2$GEPU_ppp<- as.numeric(df_clean2$GEPU_ppp)
+df_clean2$Industrial_Production<- as.numeric(df_clean2$Industrial_Production)
+df_clean2$Industrial_Capacity<- as.numeric(df_clean2$Industrial_Capacity)
+df_clean2$M2<- as.numeric(df_clean2$M2)
+df_clean2$OECD_6NME_Industrial_Production<- as.numeric(df_clean2$OECD_6NME_Industrial_Production)
+df_clean2$Petroleum_and_other_liquids_stocks_US<- as.numeric(df_clean2$Petroleum_and_other_liquids_stocks_US)
+df_clean2$Spread<- as.numeric(df_clean2$Spread)
+df_clean2$Trade_Weighted_USD<- as.numeric(df_clean2$Trade_Weighted_USD)
+df_clean2$Taux_change_effectif_USD<- as.numeric(df_clean2$Taux_change_effectif_USD)
+df_clean2$US_Ending_Stocks_Crude_Oil<- as.numeric(df_clean2$US_Ending_Stocks_Crude_Oil)
+```
+
+```{r echo=FALSE}
+# on rassemble les variables débarassées des outliers en un seul df
+df_clean1 <- as.data.frame(df_clean1)
+df_date <- df_fret %>% select(1)
+rownames(df_date) <- 1:nrow(df_date)
+df_date <- as.data.frame(df_date)
+df_clean <- cbind.data.frame(df_date,df_clean1,df_clean2)
+library(rio)
+rio::export(df_clean, "./Données/base_clean.xlsx")
+```
+
+Après avoir rassemblé les variables débarrassées des outliers en un seul data frame, notre base est prête à l'emploi puisqu'elle est propre et les variables sont stationnarisées. Nous pouvons désormais nous pencher sur la visualisation des données pour comprendre grâce à des graphiques, des statistiques et des classifications, les liens entre les variables.
+
+<br>
+
+## 2.4 Graphiques
+
+Dans un premier temps nous regardons les graphiques de certaines séries en niveau c'est à dire n'ayant subies aucune modification, de manière à comparer une variable considérée stationnaire par le test ADF et une considérée non stationnaire, puis nous regarderons l'effet de la stationnarisation sur l'évolution temporelle de ces deux variables.
+
+```{r include=FALSE}
+library(rio)
+df_fret_clean <- import("./Données/base_clean.xlsx" )
+str(df_fret_clean)
+
+library(readxl)
+df_fret <- read_excel("./Données/database project fret.xlsx")
+df_fret <- data.frame(df_fret)
+```
+
+<br>
+
+```{r echo=FALSE, fig.height=4, fig.width=6, out.width="75%"}
+# Variables non stationnaires selon le test ADF en rouge et en bleu celles stationnaires selon ADF
+
+par(mfrow=c(2,2))
+plot(y=df_fret[,4], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps', main='Variable stationnaire selon le test')
+plot(y=df_fret[,10], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps', main='Variable non stationnaire selon le test')
+plot(y=df_fret_clean[,4], x=df_fret_clean$Date, type="l", col="black", ylab = "Cours", xlab='Temps',cex=1.2, main="Variable transformée")
+plot(y=df_fret_clean[,10], x=df_fret_clean$Date, type="l", col="black", ylab = "Cours", xlab='Temps', cex=1.2, main="Variable transformée")
+```
+
+On constate sur ce graphique à 4 arguments l'apparence des variables en niveau et lorsqu'elles ont subi une transformation. En rouge nous trouvons les variations en niveau d'une variable ("Crude_Oil_Prices_Brent") classée comme stationnaire selon le test de la racine unitaire, et en bleu une variable en niveau aussi mais testée comme non stationnaire par le test ADF ("Capacity_Utilization"). Comme noté précédemment, on voit à travers ces graphiques que pour les variables considérées comme stationnaires par le test comme pour celles qui sont classées 'non stationnaires', on retrouve des tendances largement observables : à la fois sur une dépendance de la variance et/ou de la moyenne au temps. Il apparaît donc que le test statistique n'est pas fiable à 100% et il était plus prudent de stationnariser toutes les variables. Étant donné que la variable que nous expliquons est un cours boursier, les valeurs que nous avons obtenues en laguant celle-ci correspondent aux rentabilités de cet indice maritime. Aussi, si nous regardons les variables transformées en noir correspondant aux variables de la ligne supérieure, nous voyons que l'application d'un lag a bel et bien permis de les rendre stationnaires et donc exploitables. Le reste des graphiques sur les séries en niveau puis transformées est visible en annexes 1 et 2.
+
+
+<br>
+
+## 2.5 Statistiques descriptives
+
+<br>
+
+De nombreux packages sous R offrent des statistiques intéressantes et concrètes pour aider à comprendre les données. Nous confronterons les libraires **sumarytools**, **DataExplorer** et **explore** pour avoir l'analyse la plus complète possible. 
+
+```{r, echo=FALSE}
+library(summarytools)
+library(kableExtra)
+library(knitr)
+kbl(descr(df_fret_clean), format = "html") %>% kable_styling(bootstrap_options = "striped", full_width = F, position = "center")  %>% kable_paper() %>% scroll_box(width = "100%", height = "400px")
+```
+
+<br>
+
+Grâce à la libraire **sumarytools** nous constatons que les rentabilités du Baltic Dry Index s'étendent de `r round(min(df_fret_clean$Baltic.Dry.Index),2)` à `r max(df_fret_clean$Baltic.Dry.Index)` avec une moyenne de `r round(mean(df_fret_clean$Baltic.Dry.Index),3)` pour une médiane de `r median(df_fret_clean$Baltic.Dry.Index)`. En comparaison avec l'étendue de la série (*i.e.* l'écart entre les valeurs maximales et minimales), la différence entre la moyenne et la médiane est minime puisqu'il est de `r round(median(df_fret_clean$Baltic.Dry.Index)-mean(df_fret_clean$Baltic.Dry.Index),3)` et représente donc `r round((median(df_fret_clean$Baltic.Dry.Index)-mean(df_fret_clean$Baltic.Dry.Index))/(max(df_fret_clean$Baltic.Dry.Index)-min(df_fret_clean$Baltic.Dry.Index))*100,2)`% de l'étendu global de la série - soit moins de 1%. Ainsi la suppression des valeurs atypiques a-t-elle été efficace pour lisser les valeurs et ne pas altérer les calculs. 
+
+```{r echo=FALSE, out.width="75%"}
+library(DataExplorer)
+plot_missing(df_fret, ggtheme = theme_classic())
+```
+
+La libraire **DataExplorer** nous offre elle un aperçu des observations manquantes sur la base initiale, pour laquelle on observe un taux de valeurs manquantes de 5.88% pour `r 28-7` d'entre elles, ce qui représente 9 observations. Nous avons donc procédé dès le début de l'analyse à la suppression des observations incomplètes, passant ainsi de 153 à 144 mensualités. Puis en ayant différencié nos variables nous avons perdu une observation de plus, notre base finale contient donc 143 dates pour 29 variables. De même, nous observons les histogrammes de distribution de deux variables ci-dessous, nous constatons alors que les distributions s'apparentent davantage à des lois normales lorsque les données sont nettoyées. Les données nettoyées correspondent aux variables pour lesquelles on a retiré les observations manquantes, que l'on a stationnarisées et qui ont été débarrassées des points atypiques. Le changement est clair pour ces 2 variables "Crude.Oil.Prices..Brent" et "M2" - les distributions de toutes les variables de la base avant et après transformation sont quant à elles disponibles en annexe n°3. 
+
+```{r include=FALSE}
+p <- plot_histogram(df_fret[,c(4,20)], ggtheme = theme_bw(),title = "Distribution des variables brutes")
+```
+
+```{r echo=FALSE, fig.height=4, fig.width=13, fig.align='center'}
+grid.arrange(arrangeGrob(grobs = p, ncol=2, nrow=1)) 
+```
+
+```{r include=FALSE}
+pp <- plot_histogram(df_fret_clean[,c(13,23)], ggtheme = theme_bw(), title = "Distribution des variables propres")
+```
+
+```{r echo=FALSE, fig.height=4, fig.width=13, fig.align='center'}
+grid.arrange(arrangeGrob(grobs =pp, ncol=2, nrow=1))
+```
+<br>
+
+
+
+## 2.6 Méthodes de classification
+
+Dans cette partie nous allons nous intéresser à la classification de nos données; cette phase d'analyse peut nous permettre d'avoir un premier aperçu sur les variables qui divisent au mieux le jeu, celles qui sont les plus pertinentes dans l'explication de la variable à expliquer. Ainsi nous commençons par construire un arbre sur le Baltic Dry Index, puis nous réaliserons une analyse de composantes principales (ACP) pour finir sur une méthode ayant pour objectif de mettre en avant des clusters, c'est à dire des groupements de nos variables. 
+
+```{r echo=FALSE, out.width="100%"}
+# Arbre de décision CART ---------------
+library(rpart)
+library(caret)
+library(rpart.plot)
+  # On définit les paramètres de contrôle
+ctrl=rpart.control(minbucket=5, cp=0.01, xval=5, maxdepth=4)
+  # Fit BDI
+rpart_fret <- rpart(Baltic.Dry.Index ~ ., data = df_fret_clean[,2:29], control=ctrl)
+#summary(rpart_fret)
+
+  # Plot
+#par(mfrow=c(1,2))
+#par(cex=0.7, mai=c(0.1,0.1,0.2,0.1))
+#par(fig=c(0,0.6,0,1))
+rpart.plot(rpart_fret, extra=1, fallen.leaves=F, main="Arbre de décision du BDI")
+  # Voir erreur de prévision selon la taille de l'arbre
+#par(fig=c(0.7,1,0,0.5), new=TRUE)
+#plotcp(rpart_fret)
+#printcp(rpart_fret)
+```
+
+
+Le fonctionnement de l'arbre est le suivant : à chaque noeud, l'algorithme considère les N variables et cherche celle qui divise le jeu de données de la manière la plus optimale possible en maximisant la diminution globale de l'impureté, c'est-à-dire en réduisant le plus possible l'erreur. Plus simplement, à chaque noeud l'algorithme considère les variables les plus influentes et divise à partir de celles-ci un ensemble en 2 groupes qui sont les plus hétérogènes entre eux, mais les plus homogènes en leur sein. Appliqué sur nos données, l'arbre nous permet d'avoir une première idée sur l'importance de chaque variable et des liens qui les relient entre elles. 
+
+On voit ainsi qu'en partant de la valeur moyenne du BDI, à savoir `r round(mean(df_fret_clean$Baltic.Dry.Index),2)` et du jeu complet avec 143 observations, la variable qui dichotomise le jeu de données initial en 2 groupes les plus homogènes possible est celle de l'indice Kilian. Pour 88 observations de cette dernière, la valeur est supérieure à -5.9. Pour ces 88 dates, l'algorithme du CART les divise à nouveau en 2 groupes homogènes où l'un a une capacité industrielle inférieure à -0.036 et est composé de 12 observations, tandis que l'autre a une capacité industrielle supérieure ou égale à -0.036 et englobe 76 observations soit `r round(76/88*100,2)`% de ce sous-échantillon. Pour les 55 observations pour lesquelles l'indice Kilian est inférieur à -5.9, c'est la variable "VIX" qui permet de diviser ce sous-échantillon en 2 groupes hétérogènes entre eux. 
+
+
+Nous constatons donc à chaque noeud une nouvelle division du jeu ; finalement grâce à cet arbre de décision nous nous rendons compte que les variables importantes sélectionnées sont celles de l'indice Kilian (importante à 29% dans l'explication d'Y), de l'indice VIX (à 11%), de la capacité industrielle à 8%, du taux de change effectif et des enquêtes de conjoncture à 7% chacune. Nous nous attendons à ce que les variables dichotomisant le jeu aux noeuds principaux et ayant une grande importance soient significatives dans l'explication de l'indice de fret maritime, et ainsi qu'elles soient sélectionnées par les méthodes que nous appliquerons plus tard pour construire des modèles parcimonieux en dernière partie.
+
+<br>
+
+```{r include=FALSE}
+  # ACP ---------------
+library(FactoMineR)
+library(factoextra)
+library(ggplot2)
+
+  # ACP variables
+res.pca <- PCA(df_fret_clean[,2:29], quali.sup=27)
+```
+
+```{r echo=FALSE}
+par(mfrow=c(1,2))
+par(fig=c(0,0.6,0,1))
+fviz_pca_var (res.pca, col.var = "cos2",
+              gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+              repel = T, title="Cercle de corrélations des variables, ACP",
+              ggtheme = theme_minimal())
+
+par(fig=c(0.7,1,0,0.6), new=TRUE)
+```
+
+```{r echo=FALSE}
+    # Contributions des variables à l'axe 1
+z <- fviz_contrib(res.pca, choice = "var", axes = 1, col="black", top=10)
+zz <- fviz_contrib(res.pca, choice = "var", axes = 2, col="black", top=10)
+grid.arrange(arrangeGrob(z,zz, ncol=2, nrow=1), heights=c(6,2))
+```
+
+Pour compléter l'analyse de classification des variables commencée avec l'arbre de décision, nous appliquons une analyse en composantes principales (ACP) qui nous permet de grouper les variables autour d'axes fictifs et ainsi de voir les liens qui existent entre elles. Sur le cercle de corrélations des variables, il est difficile d'identifier les variables ayant des caractéristiques communes puisque les noms sont difficilement lisibles. On remarque tout de même en groupement de variables le long de l'axe n°1 avec des cosinus carrés très proches selon le code couleur : il s'agit des variables 'GEPU_current', 'Global.Economic.Policy', 'New_Based_Policy_Uncert_Index', 'GEPU_ppp' et 'Three_Component_Index' qui semblent par leur nom axées globalement sur la politique économique. Par l'annexe n°4 où sont les pourcentages de variance expliquée par les axes fictifs, on voit que la répartition de la variance expliquée par les axes est plutôt égale ; la première et la deuxième dimensions expliquent ainsi entre 30 et 31% de la variance. En regardant les graphiques de contribution des variables aux dimensions 1 et 2, nous voyons que l'axe 1 regroupe principalement les variables sur la politique économique mondiale dont nous venons de noter la proximité, tandis que l'axe 2 est axé sur le commerce extérieur avec les taux de change, les prix aux échanges etc. L'ACP nous a permis de constater les regroupements de variables tels que :
+
+* Global.Economic.Policy, GEPU_current, GEPU_ppp, News_Based_Policy_Uncert_Index et Three_Component_Index
+  
+* Trade_Weighted_USD, Gold_Princing_Index, Taux_change_effectif_USD et Crude.Oil.PRices..Brent
+
+Dans un dernier temps nous cherchons à regrouper autrement les variables ; par des Clusters en utilisant le package **ClustOfVar** qui offre un regroupement des variables et non des observations contrairement aux autres packages sous R. Cet algorithme de clustering a pour objectif d'identifier des groupes d’observations ayant des caractéristiques similaires avec le même principe que l'arbre CART, c'est-à-dire où les observations dans un même groupe se ressemblent le plus possible mais où elles se démarquent dans les groupes différents. 
+
+<br>
+
+```{r echo=FALSE, fig.height=9, fig.width=8}
+library(ClustOfVar)
+  # partitionnement des variables, dendogramme
+tree <- hclustvar(X.quanti=as.data.frame(df_fret_clean[,2:29]))
+plot(tree,main="Dendrogramme des variables")
+```
+
+```{r echo=FALSE, fig.height=4, fig.width=5,out.width="75%"}
+  # stabilité des partitionnements
+stab<-stability(tree,B=100,graph=FALSE)
+plot(stab, main="Stabilités des partitionnements", nmax=10)
+```
+
+Ainsi, on applique la fonction *hclustvar()* sur notre jeu de données, en regardant le dendogramme des variables : on observe alors quelques groupements intéressants tels que:
+
+* Global Economic Policy avec GEPU_ppp et GEPU_current dont les initiales signifient Global Economic Policy Uncertaintly (nous nous doutons de la redondance de ces variables)
+  
+* World trade volume avec la production industrielle des pays de l'OCDE
+  
+* Crude oil prices brent avec WTI qui est l'indice boursier du pétrole (le lien ici est très fort)
+  
+* Trade Weighted USD avec Taux_change_effectif_USD qui, bien que n'ayant pas les mêmes valeurs, semblent être très proches
+
+Sur le graphique de la stabilité des partitionnements on constate que la stabilité est assez constante bien qu'elle diminue légèrement selon les partitions jusqu'à 5 classes. Nous décidons de garder 3 clusters et de regarder les variables qui sont contenues dans chacune des classes. 
+
+<br>
+
+```{r echo=FALSE, fig.align='center', out.width="150%"}
+# clusters finaux
+#p3 <- cutreevar(tree,3)
+#summary(P3)
+#plot(p3)
+knitr::include_graphics(here::here("./image/Cluster.PNG"))
+```
+
+<br>
+
+Le premier groupe rassemble les variables "Crude.Oil.Prices..Brent", "WTI", "CPI" avec une forte corrélation positive avec la variable synthétique, et "Taux_change_effectif_USD" et "Trade_Weighted_USD" avec relation négative forte. Le cluster n°1 représente donc le commerce extérieur (et correspondrait ainsi à la dimension 2 de l'ACP). La deuxième classe rassemblant davantage des variables axées sur la production telles que "Container.Index", "OECD_6NME_Industrial_Production", "Capacity_Utilization", correspondrait donc à la capacité productive du pays. Enfin, le cluster n°3 s'apparente à la dimension 1 de l'ACP puisqu'elle regroupe les variables de politique mondiale qui semblent extrêmement corrélées puisqu'elles ont des corrélations proches les unes les autres avec la variable fictive du cluster n°3, et qu'elles semblent mesurer les mêmes choses - du moins c'est ce qui paraît avec la proximité de leurs noms et de leurs coefficients.  
+
+L'analyse en clustering nous a ainsi permis d'alimenter le constat sur la redondance de certaines variables explicatives, que nous avions pu noter dès la visualisation de l'arbre de décision et de l'analyse en composantes principales. Nous comprenons grâce à cette analyse descriptive, l'importance de la sélection de variables avant modélisation pour éviter les problèmes de mutlicollinéarité.
+
+
+<br>
+
+## 2.7 Corrélation 
+
+<br>
+
+```{r fig.height=7, fig.width=7, fig.align='left'}
+DataExplorer::plot_correlation(df_fret_clean)
+```
+
+<br>
+
+Aussi, après avoir regardé différentes classifications pour comprendre les liens entre nos variables, nous regardons les coefficients de corrélations (CC) que les lient entre elles. Nous voyons alors sur la matrice de corrélations que certaines variables ont un CC supérieur à 0.5, nous savons alors qu'elles ne pourront être intégrées dans un même modèle car leur dépendance peut être gênante pour les estimations. Aussi les principales corrélations sont les suivantes :
+
+* Global.Economic.Policy, GEPU_ppp et GEPU_current pour lesquelles nous avions déjà souligné un lien fort
+
+* News_Based_Policy_Uncert_index avec Three_Component_Index qui étaient regroupées dans les mêmes classes lors des visualisations de données
+
+* Crude.Oil.Prices..Brent et "WTI" qui comme souligné précédemment correspond à l'indice du pétrole ; la forte corrélation entre ces 2 variables n'est donc pas surprenante
+
+Nous devinons alors aisément que les variables "GEPU_ppp", "GEPU_current", "News_Based_Policy_Uncert_index" et "WTI" seront certainement éliminées des explicatives en raison de leur corrélation forte voire de leur redondance avec d'autres variables. Finalement, avant de commencer la sélection des variables nous pouvons regarder ces quelques graphiques qui viennent confirmer tous nos constats et conclure sur la non-pertinence de certaines variables qui contiennent les mêmes informations que d'autres. 
+
+<br>
+
+```{r echo=FALSE, fig.height=4, fig.width=10}
+library(plotly)
+library(reshape2)
+df2 <- melt(df_fret[,c(1,27,28)], id="Date")
+ggplot(df2) + geom_line(aes(x=Date, y=value, color=variable), size = 1.2) +
+    scale_colour_manual(values = c(Three_Component_Index = "blue", News_Based_Policy_Uncert_Index = "red")) + labs(title ="Evolution de variables d'indices",
+    y = "Cours") +
+    theme_minimal()
+```
+
+<br>
+
+```{r echo=FALSE, fig.height=4, fig.width=8}
+df3 <- melt(df_fret[,c(1,14,15)], id="Date")
+ggplot(df3) + geom_line(aes(x=Date, y=value, color=variable), size = 1.2) +
+    scale_colour_manual(values = c(GEPU_current = "blue", GEPU_ppp = "red")) +
+    labs(title ="Evolution des variables explicatives GEPU_current et GEPU_ppp",
+    y = "Cours") +
+    theme_minimal()
+```
+
+
+<br>
+
+<br>
+
+# 3. Sélection des variables
+
+Si nous voulions modéliser le **Baltic.Dry.Index** nous pourrions le faire par un modèle de régression linéaire multivarié sur la base de la minimisation de la variance résiduelle pour l'estimation de ses coefficients. Le problème de telles modélisations réside dans l'instabilité des résultats de l'estimation, car aucune contrainte n'est appliquée aux paramètres du modèle. Autrement dit, plusieurs modèles peuvent aboutir à des solutions proches en termes de minimisation de l'erreur, mais de faibles changements dans les données peuvent produire des modèles très différents. 
+
+C'est pour cela que l'on a recours à diverses méthodes de régularisation afin de rétrécir l'espace de solution autour de 0 : c'est pourquoi nous procéderons à la normalisation des variables explicatives et au centrage de la variable à expliquer pour enlever la constante. Ces méthodes de rétrécissement de l'espace de solution pour empêcher les valeurs trop grandes des estimateurs $\beta$ sont appelées "méthodes de *shrinkage*".
+
+<br>
+
+Plusieurs méthodes existent alors pour restreindre l'espace de solutions :
+
+* Certaines méthodes ont une approche plutôt "économétrique". Parmi les *n* variables explicatives, on va rechercher le plus petit sous-ensemble de variables qui explique notre Y. 
+
+  + **leaps and bounds** de Furnival et Wilson, qui consiste à tester des modèles pour tous les arrangements possibles. Mais cela devient rapidement infaisable avec un grand nombre de variables.
+  
+  + **régression pas à pas (stepwise)** c'est une méthode itérative qui peut se décliner en deux variantes,
+  *forward* qui initialise un modèle constitué uniquement de la constante, puis ajoute séquentiellement variable par variable celles qui améliorent le mieux l'ajustement en termes de réduction de la variabilité résiduelle. *Backward* qui fonctionne sur le même principe que la sélection *forward* mais de manière inversée ; on initialise la procédure avec un modèle complet comprenant toutes les variables que l'on va retirer séquentiellement.
+
+<br>
+
+* D'autres méthodes plus "statistiques", utilisent une fonction de **pénalisation** avec un paramètre $\lambda$ (fixé empiriquement), que l'on rajoute à la fonction coût (d'une régression) afin d'obtenir de meilleurs résultats lors de l'estimation par **validation croisée**. Un $\lambda$ élevé pénalisera plus fortement la régression, augmentant le **biais** des estimateurs mais réduisant la **variance**. Tout l'enjeu consiste donc à trouver le juste $\lambda$ qui réponde au mieux à ce compromis entre biais et variance. Autrement dit, il s'agit du compromis entre la complexité d'un modèle et sa capacité à se généraliser. Le modèle optimal est un modèle qui est capable de décrire le mieux les données d'apprentissage, et capable de faire les meilleures prévisions possible tout en restant robuste.
+
+
+<br>
+
+Avant de commencer le processus de séléction nous allons donc normaliser les variables explicatives et centrer notre variable à expliquer **Baltic.Dry.Index**, afin de retirer le problème de la constante lors de l'estimation.
+ 
+```{r}
+y <- df_fret_clean %>%
+  select(Baltic.Dry.Index) %>%
+  scale(center = T, scale = F) %>%
+  as.matrix()
+
+x <- df_fret_clean %>%
+  select(-c(1,2)) %>%      # on retire la variable à expliquer et la date
+  as.matrix()
+```
+
+<br>
+
+
+## 3.1 Approche économétrique : GETS {.tabset}
+
+### Théorie
+
+La méthode **GETS** (general-to-specific), est une méthode de la famille des backward selections c'est-à-dire qui commence à partir d'un modèle général et qui, après estimation de plusieurs modèles, procède à l'élimination des variables non significatives seulement si les hypothèses sont respectées à chaque spécification. L'objectif final de cette méthode est de trouver un modèle qui n'omette pas de variables explicatives importantes (bonne *spécification*) et qui retire toutes les variables superflues (*parcimonieux*). 
+
+L'application de la méthode GETS sur notre jeu de données se fera avec le package `gets`. Cette méthode se déroule en plusieurs étapes : 
+
+ * La première consiste à estimer un modèle non restreint général, ce qui dans notre cas sera un *modèle autorégressif d'ordre 1* AR(1)
+ 
+ * La deuxième consiste à réaliser des tests sur les résidus afin de vérifier le respect des hypothèses :
+    
+    + Tests d’autocorrélation sur les résidus standardisés (Ljung et Box, 1979)
+    
+    + Tests d’hétéroscédasticité conditionnelle sur les résidus standardisés au carré (Ljung
+et Box, 1979)
+
+    + Test de normalité (Jarque et Bera, 1980)
+
+### Application
+    
+```{r}
+library(stargazer)
+library(lgarch)
+library(gets)
+
+tbase <- df_fret_clean[,-1]
+class(tbase[,2:28]) #tibble
+
+#class(newbase[,2:28])
+mX = data.matrix(tbase[,2:28])
+#str(mX)
+
+# ARX model 
+
+AR_BDI <- arx(tbase$Baltic.Dry.Index, mc = T, ar = 1, mxreg = mX[,c(1:27)], vcov.type = "white", normality.JarqueB=T)
+AR_BDI
+```
+
+On peut constater que seules quelques variables sont significatives dans le *General Unrestreicted Model* GUM, et si on regarde les tests sur les résidus on voit qu'ils sont non corrélés au seuil de risque de 5% - par contre ils ne valident pas le test d'homoscédasticité ni celui de la normalité.
+
+* Dans cette deuxième étape nous estimons le modèle en appliquant l'algorithme GETS qui éliminera de manière successive (backward elimination) les variables non significatives du GUM à partir d’un seuil de significativité fixé à 5%. Comme la première étape, la validité de chaque suppression est vérifiée par rapport aux tests de diagnostic des résidus. L'algorithme prendra fin lorsqu'il aura sélectionné, parmi les modèles terminaux, la spécification la mieux ajustée selon le critère d’ajustement du **BIC**.
+
+```{r}
+#getsm_BDI <- getsm(AR_BDI)
+#getsm_BDI
+```
+   
+<br>
+
+L'estimation par la méthodologie Gets ne fonctionne pas si nous ne lui disons pas de ne pas appliquer l'hypothèse d'homoscédasticité des résidus. C'est l'une des limites que nous pouvons constater de cette méthode; il peut arriver que les tests de diagnostics (autocorrélation et hétéroscédasticité conditionnelle) soient trop restrictifs et ne sélectionnent aucune variable ou alors un très petit nombre. C'est pourquoi nous allons réestimer en relâchant la contrainte d'homoscédasticité des résidus (ARCH).
+
+<br>
+
+```{r}
+    # GETS modelling without ARCH test
+getsm_BDI2 <- getsm(AR_BDI, arch.LjungB=NULL)
+getsm_BDI2
+```
+
+Cette fois-ci la méthodologie GETS a fonctionné et nous pouvons observer à partir de la sortie précédente que le processus a réalisé 23 estimations au total. De ces 23, il en conserve 5 comme modèles terminaux et en sélectionne un seul. L'algorithme Gets a sélectionné un modèle contenant 9 variables explicatives, toutes significatives à 10%. Les variables explicatives sélectionnées expliquent environ 50% de la variance du Baltic.Dry.Index.
+
+Malgré le fait d'avoir supprimé la contrainte d'homoscédasticité des résidus lors du processus de sélection, le modèle final ne remplit toujours pas cette hypothèse. Cela vient donc confirmer la limite de cette méthode de sélection de variables; c'est pourquoi d'autres méthodes moins contraignantes sont privilégiées.
+
+Nous allons tout de même conserver les variables et leurs coefficients respectifs pour une comparaison générale entre méthodes de sélection. 
+
+```{r}
+    # GETS betas
+gets_beta <- coef.arx(getsm_BDI2)
+gets_beta
+```
+
+<br>
+
+### Fonction 'isat'
+
+Avant de passer à des méthodes de régressions pénalisées, le package `gets` propose la fonction **isat()** qui réalise la méthode de *saturation d'indicateurs* (IS) permettant la détection de ruptures et d'outliers. 
+
+* Cette méthode permet 3 approches :
+  
+  + Saturation d’indicateurs d’impulsion (IIS, impulse indicator saturation)
+  + Saturation d’indicateurs d’étape (SIS, step-indicator saturation)
+  + Saturation d’indicateurs de tendance (TIS, trend-indicator saturation)
+  
+Ci-dessous sont visibles les estimations par MCO via ces 3 approches ainsi que la représentation graphique du meilleur modèle. Celui-ci combine à la fois des indicateurs d'étape et de tendance avec un $R^2$=0.70069.
+
+```{r echo=FALSE}
+    # isat function
+library(gridExtra)
+yy <- tbase[,1]
+#isat(yy, sis=TRUE, iis=FALSE, plot=F, t.pval=0.005)
+#isat(yy, sis=FALSE, iis=TRUE, plot=F, t.pval=0.005)
+#isat(yy, sis=FALSE, iis=FALSE, tis=TRUE, plot=F, t.pval=0.005)
+isat(yy, sis=TRUE, iis=TRUE, tis=TRUE, plot=TRUE, t.pval=0.005)
+```
+
+<br>
+
+<br>
+
+
+
+## 3.2 Régressions pénalisées : 
+
+```{r include=FALSE}
+library(glmnet)
+library(rbridge)
+library(msaenet)
+```
+
+### 3.2.1 Ridge regression {.tabset}
+
+#### Théorie
+
+La régression Ridge a été initialement proposée pour limiter l'instabilité liée à des variables explicatives trop corrélées entre elles. La pénalisation *ridge* va diminuer la distance entre les solutions possibles sur la base de la distance euclidienne. Autrement dit elle ajoute des contraintes sur les estimateurs en réduisant leur amplitude, et par conséquent rendra faibles certains coefficients de l’estimation pour les variables moins pertinentes. 
+
+Quand le paramètre $\lambda$ est proche de 0 on s'approche de la solution *"classique*", non pénalisée, et quand $\lambda$ tend vers l'infini, la pénalisation est telle que tous les paramètres valent 0. Lorsque $\lambda$ augmente, on augmente donc le biais de la solution mais on diminue sa variance. Afin d'optimiser le compromis **biais-variance** nous avons recours aux :
+
+* critères d’information (IC, information criteria)
+* critères de validation croisée (CV, cross-validation)
+
+L'inconvénient de cette méthode est qu'elle ne sélectionne pas de variables explicatives car elles sont toutes présentent dans le modèle final ce qui nous empêche de conclure sur l'importance de chaque variable dans l'explication de la variable à expliquer.
+
+
+#### Application
+
+Nous allons à présent appliquer la régression ridge à nos données, en paramétrant à la fois la *cross-validation* à 10 estimations, et en définissant le nombre de $\lambda$ qui sera testé (100), dont les valeurs seront sélectionnées aléatoirement parmi une plage de données renseignée allant de -3 à 5.
+
+<br>
+
+```{r echo=FALSE}
+# Ridge regression
+# 10-folds CV to choose lambda
+# seq(-3, 5, length.out = 100) : random sequence of 100 numbers betwwene -3 and 5
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+# alpha = 0, implementation of ridge regression
+# choix du meilleur lambda parmi 100
+ridge_cv <- cv.glmnet(x, y, alpha = 0, lambda = lambdas_to_try, standardize = T, nfolds = 10)
+#ridge_cv
+# Figures of lambdas
+plot(ridge_cv)
+```
+
+
+Le graphique ci-dessus nous présente les erreurs de prévisions par cross-validation pour toutes les valeurs de $\lambda$ initialisées précédemment. La zone délimitée par les traits en pointillés correspond aux valeurs de $\lambda$ pour lesquelles le **Mean-Squared Error** est minimisé. 
+
+L'étape suivante consiste à conserver les $\lambda$ sélectionnés par la première estimation, et de ré-estimer le modèle à partir de ceux-ci : nous obtenons alors l'ensemble des coefficients (biaisés) de la régression ridge.
+
+```{r echo=TRUE}
+# Best lambda obtained from CV (lambda.min) - other possibility: lambda.1se
+lambda_cv <- ridge_cv$lambda.min
+
+# Evaluation of the final model with the selected lambda
+model_cv <- glmnet(x, y, alpha = 0, lambda = lambda_cv, standardize = T)
+model_cv
+```
+
+```{r echo=FALSE}
+# Ridge betas
+ridge_beta <- model_cv$beta
+ridge_beta
+```
+
+<br>
+
+<br>
+
+### 3.2.2 Lasso regression {.tabset}
+
+
+#### Théorie
+
+La méthode du **LASSO** (Least Absolute Shrinkage and Selection Operator) en comparaison à la régression ridge, va diminuer la distance des solutions possibles sur la base de la *distance de Manhatan* et non euclidienne. C'est une forme de pénalisation qui a la capacité d’éliminer les variables inutiles en fixant des coefficients à 0. Cela permet de simplifier les modèles en les rendant parcimonieux. Le LASSO ne fait donc pas de régression linéaire classique mais une régression régularisée qui rend nuls certains coefficients de l’estimation.
+
+
+L'*avantage* du cette méthode est qu'elle réalise une vraie sélection de variables en tronquant à 0 les variables "inutiles". En ce qui concerne ses *limites* en revanche, la régression Lasso pose problème en présence de variables corrélées car elle choisit aléatoirement une des deux variables et met l'autre à 0. De plus, avant toute estimation il est nécessaire de normaliser les données car cette méthode est sensible aux échelles des différentes variables explicatives dans son processus de sélection.
+
+
+
+#### Application
+
+De la même façon que pour **ridge**, nous allons lui indiquer les paramètres avant de lancer l'estimation. Puis nous conserverons les $\lambda$ qui minimisent l'erreur et nous estimerons le modèle final à partir de ceux-ci.
+
+
+```{r echo=TRUE}
+# LASSO regression
+# 10-folds CV to choose lambda
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+
+# alpha = 1, implementation of Lasso regression
+lasso_cv <- cv.glmnet(x, y, alpha = 1, lambda = lambdas_to_try, standardize = T, nfolds = 10) # choix du meilleur lambda parmi 100
+
+# Figures of lambdas
+plot(lasso_cv)
+```
+
+<br>
+
+Comme pour RIDGE, le graphique ci-dessus nous présente les erreurs de prévision par cross-validation pour les 100 valeurs de $\lambda$ choisies aléatoirement.
+
+```{r echo=TRUE}
+# Best lambda obtained from CV (lambda.1se) - other possibility: lambda.min
+lambda_cv <- lasso_cv$lambda.1se
+
+# Evaluation of the final model with the selected lambda
+model_cv <- glmnet(x, y, alpha = 1, lambda = lambda_cv, standardize = T)
+```
+
+```{r echo=FALSE}
+# Lasso betas
+lasso_beta <- model_cv$beta
+lasso_beta
+# Get the name of relevant variables
+#which(! coef(model_cv) == 0, arr.ind = TRUE)
+```
+
+Après réestimation du modèle définitif à partir des paramètres choisis, on voit que la méthode ne conserve qu'une seule variable explicative pour le modèle et est donc très parcimonieuse, il s'agit de **Indice_Kilian**. Nous notons par ailleurs que cette variable est celle qui apparaissait la plus importante lors de la classification de notre base par l'arbre de décision, ce qui vient donc confirmer notre hypothèse selon laquelle les variables divisant le jeu de données aux noeuds principaux seraient certainement retenues pour la suite de l'analyse. 
+
+<br>
+
+<br>
+
+
+
+### 3.2.3 Weighted fusion Lasso regressions {.tabset}
+
+
+#### Théorie 
+
+Les méthodes aLASSO et WF Fusion entre autres permettent de pallier au problème de sélection de variables via l’ajout de poids ; la *régression Weighted Fusion* **(WF)** rectifie le problème de corrélations entre les variables explicatives par l’ajout de données. La "fusion pondérée" peut potentiellement incorporer la redondance des informations entre les variables corrélées pour l'estimation et la sélection des variables. Elle est également utile lorsque le nombre de variables est supérieur au nombre d'observations. La WF Lasso permet ainsi d’améliorer la sélection des variables et la précision des prévisions.
+
+
+#### Application
+
+```{r echo=TRUE, fig.height=7, fig.width=14}
+# Weighted fusion Lasso regressions
+
+# Initialization of parameters
+gamma=0.5
+mu=0.1
+
+# Compute pxQ matrix.
+cor.mat <- cor(x)
+abs.cor.mat <- abs(cor.mat)
+sign.mat <- sign(cor.mat) - diag(2, nrow(cor.mat))
+Wmat <- (abs.cor.mat^gamma - 1 * (abs.cor.mat == 1))/(1 -abs.cor.mat * (abs.cor.mat != 1))
+weight.vec <- apply(Wmat, 1, sum)
+fusion.penalty <- -sign.mat * (Wmat + diag(weight.vec))
+
+# Compute Cholesky decomposition
+R<-chol(fusion.penalty, pivot = TRUE)
+
+# Transform Weighted Fusion in a Lasso issue
+p<-dim(x)[2]
+xstar<-rbind(x,sqrt(mu)*R)
+ystar<-c(y,rep(0,p))
+
+# Apply Lasso .
+fit_wfusion<-glmnet(xstar,ystar)
+fit_cv_wfusion<-cv.glmnet(xstar,ystar)
+
+par(mfrow=c(1,2))
+plot(fit_wfusion,xvar ="lambda",label = FALSE,col=T,xlab=expression(log(lambda)))
+plot(fit_cv_wfusion,xlab=expression(log(lambda)))
+```
+
+
+
+```{r echo=TRUE}
+min(fit_cv_wfusion$cvm)
+lambda.opt<-fit_cv_wfusion$lambda.min
+
+# We obtain the estimator of beta_weighted-fusion
+wfusion_beta<-predict(fit_wfusion,type="coef",s=lambda.opt)
+show(wfusion_beta)
+```
+
+Avec cette méthode de séléction nous conservons 7 variables explicatives.
+
+<br>
+
+<br>
+
+
+### 3.2.4 Elastic-Net regression {.tabset}
+
+#### Théorie
+
+En règle général, la régression *ridge* donne de meilleurs résultats que la *LASSO* lorsque les variables sont corrélées entre elles. Mais si on utilise ridge, on ne peut pas réduire le nombre de variables. Pour sortir de ce dilemme, il existe la régression **Elastic-Net** qui ajoute une pénalisation
+Ridge en plus de celle de LASSO et donc combine les deux approches.
+
+Cette régression permet à la fois de gérer les problèmes liés aux corrélations entre variables explicatives (*ridge*), et de retirer les variables non pertinentes pour l'estimation d'un modèle final parcimonieux (*LASSO*).
+
+Le paramètre $\alpha$ est compris entre 0 et 1, il va permettre de définir l'équilibre entre *ridge* et *LASSO*. Lorsque $\alpha = 1$ nous auront à faire à LASSO et pour $\alpha = 0$ à la régression ridge. En effet, quand $\alpha$ augmente de 0 à 1 avec $\lambda$ fixe, le nombre de variables retirées du modèle augmente de façon monotone.
+
+#### Application
+
+Avant de procéder à la régression Elastic-Net nous devons donc approximer les valeurs des paramètres $\alpha$ et $\lambda$ qui minimiseraient l'erreur de cross-validation. Le code suivant permet cette recherche des hyperparamètres.
+
+```{r echo=TRUE}
+library(doParallel)
+library(foreach)
+# Elastic-Net regression
+# Choose alpha sequencially with 0 < alpha < 1
+
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+a <- seq(0.1, 0.9, 0.05)
+search <- foreach(i = a, .combine = rbind) %dopar% {
+cv <- glmnet::cv.glmnet(x, y,  alpha = i, lambda = lambdas_to_try, standardize = T, nfolds = 10)
+  data.frame(cvm = cv$cvm[cv$lambda == cv$lambda.1se], lambda.1se = cv$lambda.1se, alpha = i)
+}
+
+# Implementation of EN regression
+elasticnet_cv <- search[search$cvm == min(search$cvm), ]
+elasticnet_cv$alpha
+elasticnet_cv$lambda.1se
+elasticnet_cv$cvm
+# Figures of lambdas
+```
+
+* La valeur de $\alpha$ est `r elasticnet_cv$alpha`
+* La valeur de $\lambda$ est `r round(elasticnet_cv$lambda.1se,2)`
+* La moyenne des erreurs de cross-validation est 300931.7
+
+<br>
+
+```{r echo=FALSE}
+# Graphics of lambdas_to_try
+lambdas_to_try <- 10^seq(from = -3, to = 5, length.out = 100)
+model_graph <- cv.glmnet(x, y,  alpha = elasticnet_cv$alpha, lambda = lambdas_to_try, standardize = T, nfolds = 10)
+plot(model_graph)
+```
+
+<br>
+Le graphique ci-dessus représente les erreurs de prévision par cross-validation pour les 100 valeurs de $\lambda$ choisies aléatoirement entre -3 et 5.
+
+Une fois ces valeurs connues, nous réalisons l'estimation en précisant ces paramètres et nous récupérons comme pour les autres estimations les coefficients $\beta$ des variables explicatives conservées.
+
+```{r echo=TRUE}
+# Best lambda obtained from CV (lambda.1se) - other possibility: lambda.min
+lambda_cv <- elasticnet_cv$lambda.1se
+
+# Evaluation of the final model with the selected lambda
+model_cv <- glmnet(x, y, lambda = elasticnet_cv$lambda.1se, alpha = elasticnet_cv$alpha)
+```
+
+```{r echo=FALSE}
+# EN betas
+en_beta <- model_cv$beta
+en_beta
+```
+
+```{r eval=FALSE, include=FALSE}
+# Get the name of relevant variables
+which(! coef(model_cv) == 0, arr.ind = TRUE)
+```
+
+La régression Elastic-Net montre alors 5 variables importantes à garder pour les estimations, qui correspondent aux indices 7, 8, 15, 18 et 25 des variables explicatives.
+
+<br>
+
+<br>
+
+
+### 3.2.5 Bridge regression {.tabset}
+
+#### Théorie
+
+En ce qui concerne la régression **Bridge**, elle vient comme la régression *Elastic-Net* faire un mixte entre les régressions *Ridge* et *LASSO* mais avec cette fois un paramètre $q$ qui vient agir sur $\lambda$ et contrôler le degré de biais affecté lors de l'estimation des coefficients. Lorsque $q = 2$ nous avons à faire à une régression Ridge et lorsque $q = 1$ à une régression LASSO. Pour avoir un modèle parcimonieux il est préférable de paramétrer $q$ entre 0 et 1. C'est pouquoi nous avons fixé q à 0.5 dans notre cas pratique.
+
+
+#### Application
+
+```{r echo=TRUE}
+# Bridge regression
+# 10-folds CV to choose lambda
+# seq(-3, 5, length.out = 100) : random sequence of 100 numbers betwwene -3 and 5
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+# choix du meilleur lambda parmi 100
+bridge_cv <- cv.bridge(x, y, q=0.5, lambda = lambdas_to_try, nfolds = 10)
+# Figures of lambdas
+plot(bridge_cv)
+```
+
+
+```{r echo=TRUE}
+# Best lambda obtained from CV (lambda.min) - other possibility: lambda.1se
+lambda_cv <- bridge_cv$lambda.min
+
+# Evaluation of the final model with the selected lambda
+model_cv <- bridge(x, y, q=0.5, lambda = lambda_cv)
+summary(model_cv)
+```
+
+```{r echo=FALSE}
+# Ridge betas
+bridge_beta <- model_cv$beta
+bridge_beta
+```
+
+Après récupération du $\lambda$ optimal, la régression Bridge a sélectionné 3 variables explicatives hors constante avec des coefficients non nuls. Nous passons maintenant à d'autres techniques de sélection de variables.
+
+<br>
+
+<br>
+
+### 3.2.6 SCAD {.tabset}
+
+#### Théorie
+
+Le problème des régressions présentées précédemment à savoir LASSO, Ridge, Elastic Net et Bridge est que lorsque le nombre de variables pertinentes est très faible par rapport au nombre d’observations, les variables peuvent être parasites pour la régression et biaisées. Une des solutions à ce problème souligné par Fan, Li et Zhang consiste à augmenter le paramètre de lissage $\lambda$. Une autre réside dans de nouvelles approches telles que la régression **SCAD** ("*smoothly clipped absolute deviations*"), qui introduit une fonction de pénalité bloquant la valeur d'un coefficient associé à une variable pertinente. De cette manière, la pénalité SCAD conserve le taux de pénalisation (et le biais) du LASSO pour les petits coefficients, mais l’assouplit continuellement à mesure que la valeur absolue du coefficient augmente - sélectionnant alors des modèles plus parcimonieux avec un biais réduit. Le fonctionnement de la pénalité SCAD est le suivant :
+
+* la pénalité est linéaire en $\beta$ quand $|\beta|≤ \lambda$
+* la pénalité est quadratique quand $\lambda ≤ |\beta| ≤ a\lambda$
+* la pénalité est constante quand $|\beta| > a\lambda$
+
+Nous comprenons alors que la régression SCAD pénalise plus sévèrement que le LASSO les petits coefficients, en revanche elle pénalise moins les grands coefficients, et pallie ainsi au problème soulevé antérieurement.
+
+#### Application
+
+```{r echo=TRUE}
+library(ncvreg)
+fit_SCAD=ncvreg(x, y, penalty = c("SCAD"))
+plot(fit_SCAD)
+summary(fit_SCAD, lambda=30) #On choisi 30 comme valeur de Lambda.
+```
+
+
+```{r echo=TRUE}
+# Validation croisé pour le meilleur lambda
+cvfit_SCAD=cv.ncvreg(x, y, penalty = c("SCAD"))
+plot(cvfit_SCAD)
+```
+
+```{r echo=TRUE}
+# On attribue le meilleur lambda
+lambda_SCAD <- cvfit_SCAD$lambda.min
+
+#Modele finale
+SCAD_Final=ncvreg(x, y, lambda=lambda_SCAD, alpha = 1)
+```
+
+
+```{r echo=TRUE}
+scad_beta <- SCAD_Final$beta
+scad_beta
+```
+La SCAD nous donne donc 7 variables à conserver pour l'estimation finale.
+
+```{r eval=FALSE, include=FALSE}
+which(! coef(SCAD_Final) == 0, arr.ind = TRUE)
+```
+
+
+
+#### Complément 
+
+Bien que nous ne l’appliquions pas, nous trouvions intéressant d’expliquer rapidement le fonctionnement de la régression «*minimax concave penalty*» **(MCP)** puisqu’il est très proche de celui de la méthode de SCAD. Comme elle, le MCP commence par appliquer le même taux de pénalisation que le LASSO et le relâche lentement à mesure que la valeur des coefficients augmente. Comparé au SCAD cependant, le MCP relâche la pénalité immédiatement tandis que pour le SCAD le taux continue d’augmenter avant de décroître. Autrement dit, la fonction de pénalité du MCP est la même que celle du SCAD mais est composée seulement de 2 paliers (sur les 3 présentés dans la méthode SCAD).
+
+<br>
+
+<br>
+
+### 3.2.7 Adaptive Lasso regression {.tabset}
+
+#### Théorie
+
+Par rapport à la régression LASSO, la méthode *Adaptive LASSO* ("aLASSO") résout le problème de sélection de variables.
+En effet, bien que la régression LASSO ait de nombreux avantages, ses estimateurs sont biaisés et ce biais ne disparaît pas nécessairement lorsque ${n \to \infty}$. Ce biais dans l’estimation du LASSO est d'environ $\lambda$ pour les coefficients de régression élevés. Or, étant donné que le biais de l'estimation est déterminé par $\lambda$, une approche pour réduire le biais du lasso consiste à utiliser l'approche de pénalité pondérée. C’est le principe de la régression aLASSO : les poids sont adaptés aux variables et sont tels que les variables avec de coefficients élevés ont des poids plus faibles - ce qui permet de réduire le biais d’estimation du LASSO tout en conservant sa propriété de parcimonie, voire même améliorer la précision de sélection des variables. Ainsi la régression ‘aLASSO’ résout le problème de sélection de variables du LASSO par l’ajout d’un paramètre de pondération des variables. 
+
+
+#### Application
+
+```{r echo=TRUE}
+# Adaptive Lasso regression
+
+#LASSO
+model_cv <- glmnet(x, y, alpha = 1, lambda = lambda_cv, standardize = T)
+coef_lasso<-predict(model_cv,type="coef",s=lambda_cv)
+
+# Weighted with gamma = 0.5
+gamma=0.5
+w0<-1/(abs(coef_lasso) + (1/length(y)))
+poids.lasso<-w0^(gamma)
+
+# Adaptive LASSO
+fit_adalasso <- glmnet(x, y, penalty.factor =poids.lasso)
+fit_cv_adalasso<-cv.glmnet(x, y,penalty.factor=poids.lasso)
+
+# Figure of lambdas
+plot(fit_cv_adalasso)
+```
+
+
+```{r echo=TRUE}
+# Best lambda obtained from CV (lambda.1se) - other possibility: lambda.min
+lambda_cv <- fit_cv_adalasso$lambda.1se
+
+# Evaluation of the final model with the selected lambda
+model_cv <- glmnet(x, y, alpha = 1, lambda = lambda_cv, standardize = T)
+```
+
+```{r echo=TRUE}
+# Lasso betas
+alasso_beta <- model_cv$beta
+alasso_beta
+```
+
+Nous pouvons constater que la méthode aLASSO par rapport à la méthode LASSO sélectionne une variable supplémentaire "Trade_Weighted_USD", l"indice_kilian" restant dans l'estimation. Par ailleurs on voit que son coefficient est plus fort que lors de l'estimation LASSO, à savoir 10.41 contre 9.22.
+
+```{r eval=FALSE, include=FALSE}
+# Get the name of relevant variables
+which(! coef(model_cv) == 0, arr.ind = TRUE)
+```
+
+
+<br>
+
+<br>
+
+
+### 3.2.8 Adaptive Elastic-Net {.tabset}
+
+#### Théorie
+
+La régression "Adaptive Elastic Net" **(aEN)** a été présentée dès 2009 par Zou et Zhang qui ont réfléchi au problème de colinéarité pour la sélection et l'estimation de modèles, lorsque le nombre de paramètres diverge de la taille de l'échantillon. La méthode Elastic-Net adaptif a donc été développée : elle combine les forces de la régularisation quadratique à celles du lasso pondéré de manière adaptative. L’aEN traite donc mieux le problème de colinéarité que les autres méthodes de sélection de variables, bénéficiant ainsi de performances d'échantillon fini améliorées.
+
+
+
+#### Application 
+
+Pour cette méthode comme pour adaptive SCAD, MS-aEN et MS-aSCAD nous utiliserons les fonctions contenues dans le package "*msaenet*" sous R.
+
+```{r echo=TRUE}
+
+## adaptive EN
+# Choose alpha sequencially with 0 < alpha < 1
+a <- seq(0.1, 0.9, 0.05)
+aenet.fit <- aenet(x, y, family = "gaussian", init = "enet", alphas = a, tune = "cv", nfolds = 10, seed = 1001)
+print(aenet.fit)
+coef(aenet.fit)
+```
+
+
+```{r echo=TRUE}
+# Adaptive EN beta
+aen_beta <- aenet.fit$beta
+aen_beta
+# Get the name of relevant variables
+which(! coef(aenet.fit) == 0, arr.ind = TRUE)	
+```
+
+```{r echo=TRUE}
+msaenet.nzv(aenet.fit)		# Get Indices of Non-Zero Variables
+msaenet.fp(aenet.fit, 1:5)	# Get the Number of False Positive Selections
+msaenet.tp(aenet.fit, 1:5)	# Get the Number of True Positive Selections
+```
+
+La méthode 'Elastic-Net adaptée' appliquée à notre jeu de données donne les mêmes résultats que l'EN basique : ces régressions sélectionnent toutes deux 5 variables qui sont "indice_kilian", "Three_Component_Index", "Consumer_Sentiment", "GEPU_ppp" et "Trade_Weighted_USD". En revanche, le coefficient estimé pour chacune des variables sélectionnées est différent, ils semblent ainsi plus proches de 0 dans le cas de la méthode EN ; le $\beta$ positif de l'indice Kilian est inférieur (12.34 pour EN contre 16.81 pour aEN) mais les betas négatifs sont supérieurs (-5.14 pour EN contre -28.24 pour aEN par exemple pour Consumer_Sentiment).
+
+Les effets de chaque variable sur l'indice maritime semblent ainsi renforcés dans l'aEN par rapport à la régression Elastic-Net classique. 
+
+<br>
+
+<br>
+
+### 3.2.9 Adaptive SCAD-Net
+
+<br>
+
+```{r echo=TRUE}
+## Adaptive SCAD-Net
+a <- seq(0.1, 0.9, 0.05)
+asnet.fit <- asnet(x, y, family = "gaussian", init = "snet", alphas = a, tune = "cv", nfolds = 10, seed = 1001)
+print(asnet.fit)
+coef(asnet.fit)
+```
+
+
+```{r echo=TRUE}
+# Adaptive SCAD beta
+ascad_beta <- asnet.fit$beta
+ascad_beta 
+
+# Get the name of relevant variables
+which(! coef(asnet.fit) == 0, arr.ind = TRUE)	
+```
+
+```{r echo=TRUE}
+msaenet.nzv(asnet.fit)		# Get Indices of Non-Zero Variables
+msaenet.fp(asnet.fit, 1:5)	# Get the Number of False Positive Selections
+msaenet.tp(asnet.fit, 1:5)	# Get the Number of True Positive Selections
+```
+
+Par rapport à toutes les autres méthodes de sélection de variables que nous avons appliquées jusqu'alors, la régression "Adaptive SCAD-Net" est la moins parcimonieuse puisqu'elle indique que 16 variables sont à garder dans les estimations. Jusqu'à présent, c'était la méthode automatique GETS qui sélectionnait le plus grand nombre de variables (9). Parmi les variables écartées par l'aSCAD-N on retrouve "Three_Component_Index" et "Global.Economic.Policy" dont nous avions constaté précédemment la forte corrélation avec les autres régresseurs. 
+
+<br>
+
+<br>
+
+
+### 3.2.10 Multi-Step Adaptive Elastic-Net {.tabset}
+
+#### Théorie
+
+Le "*Multi-step Adaptive Elastic Net*" **(MSA-Enet)** a été développé en 2015 par Nan Xiao et Qingsong Xu. Cette méthode vise à réduire le nombre de faux-positifs, tout en maintenant la précision de l'estimation. Cela est rendu possible en analysant les variables éliminées à chaque étape, pour mieux comprendre la structure des groupes de variables corrélées. Son fonctionnement est le suivant :
+
+* les poids sont initialisés en début de procédure
+* la fonction de poids de l’aEN est appliquée
+* les poids adaptifs sont mis à jour
+
+
+L’algorithme itère jusqu’à trouver les bonnes variables à retenir, et ainsi le MSA-Enet pallie aux nombreux problèmes de sélection et de régression de variables.
+
+
+#### Application 
+
+```{r echo=TRUE}
+## Multi-Step Adaptive Elastic-Net
+a <- seq(0.1, 0.9, 0.05)
+msaenet.fit <- msaenet(x, y, family = "gaussian", init = "enet", alphas = a, tune = "cv", nfolds = 10, seed = 1001)
+print(msaenet.fit)
+coef(msaenet.fit)
+```
+
+
+```{r echo=TRUE}
+# MS Adaptive EN beta
+msaen_beta <- msaenet.fit$beta
+msaen_beta
+
+# Get the name of relevant variables
+which(! coef(msaenet.fit) == 0, arr.ind = TRUE)	
+```
+
+```{r echo=TRUE}
+msaenet.nzv(msaenet.fit)		# Get Indices of Non-Zero Variables
+msaenet.fp(msaenet.fit, 1:5)	# Get the Number of False Positive Selections
+msaenet.tp(msaenet.fit, 1:5)	# Get the Number of True Positive Selections
+```
+
+De la même manière que pour les régressions Elastic_net et Adaptive Elastic-net, la méthode retient les 5 mêmes variables dont les coefficients sont très proches de ceux estimés par aEN avec un écart de moins d'un point pour chaque $\beta$.
+
+<br>
+
+<br>
+
+
+### 3.2.11 Multi-Step Adaptive SCAD-Net
+
+<br>
+
+
+```{r echo=TRUE}
+## Multi-Step Adaptive SCAD-Net (Est-ce la même chose que MD aSCAD ?)
+a <- seq(0.1, 0.9, 0.05)
+msasnet.fit <- msasnet(x, y, family = "gaussian", init = "snet", alphas = a, tune = "cv", nfolds = 10, seed = 1001)
+print(msasnet.fit)
+coef(msasnet.fit)
+```
+
+
+```{r echo=TRUE}
+# MS Adaptive SCAD beta
+msascad_beta <- msasnet.fit$beta
+msascad_beta
+
+# Get the name of relevant variables
+which(! coef(msasnet.fit) == 0, arr.ind = TRUE)
+```
+
+```{r echo=TRUE}
+msaenet.nzv(msasnet.fit)		# Get Indices of Non-Zero Variables
+msaenet.fp(msasnet.fit, 1:5)	# Get the Number of False Positive Selections
+msaenet.tp(msasnet.fit, 1:5)	# Get the Number of True Positive Selections
+```
+
+La méthode Adaptive SCAD appliquée précédemment s'est révélée être la moins parcimonieuse de toutes puisqu'elle a sélectionné 16 régresseurs. La même méthode avec plusieurs étapes (multistep) donne les mêmes résultats à peu de choses près : 15 variables sont sélectionnées et cette fois l'indice "WTI" est écarté - variable pour laquelle nous avions noté précédemment une forte corrélation aux autres facteurs explicatifs.
+
+<br>
+
+<br>
+
+## 3.3 Autre approche : {.tabset}
+
+### Théorie
+
+Nous avons ainsi vu qu’il existe un nombre important de méthodes de sélection de variables, chacune avec ses avantages et se complétant les unes les autres. De nombreuses autres méthodes existent encore pour répondre à la problématique d'un grand nombre de données, telles que les méthodes proximales, la PLS, la régression en composantes principales, l'algorithme FISTA, le ScoTLASS, le smooth-LASSO, le kernelLASSO, les algorithmes génétiques, les forêts aléatoires, les réseaux de neurones MONNA, la méthode BoLASSO etc. Dans une dernière sous-section, c'est à cette dernière méthode que nous nous intéresserons ; nous commencerons par expliquer son fonctionnement théorique (comme pour les autres méthodes de sélection de variables), avant de l'appliquer sur notre base de données.  
+
+Développée par Francis R.Bach en 2008, la méthode BoLASSO correspond à une régression LASSO avec une perturbation bootstrap. Le bootstrap est une méthode de rééchantillonage visant à évaluer la performance générale d'un modèle en divisant la base afin d'estimer les performances sur un ensemble de validation. Un échantillon Boostrap étant construit par un tirage avec remise de n-observations parmi n-observations, il correspond à un cas particulier de l'échantillon d'origine car il garde les mêmes proportions mais est distribué de manière aléatoire. L’estimateur Bolasso est construit à partir de M échantillons bootstraps indépendants et est défini comme l’intersection de ces M ensembles amenant ainsi a un estimateur consistant en termes de sélection.
+
+La méthode de sélection de variables "BoLasso" conduit à une sélection cohérente du modèle sans la condition de consistance requise par une régression LASSO basique. Francis Bach a effectivement montré dans un document de recherche, que lorsque la décroissance spécifique du paramètre de régularisation est proportionnelle à $n^−1/2$, où n est le nombre d'observations, alors le Lasso sélectionne toutes les variables qui devraient entrer dans le modèle (les variables pertinentes) avec une probabilité augmentant exponentiellement à n - alors qu'il sélectionne toutes les autres variables avec une probabilité strictement positive. Le problème avec cette propriété est que si plusieurs ensembles de données générés à partir de la même distribution étaient disponibles, alors toutes les variables pertinentes seraient toujours sélectionnées pour tous les ensembles de données, mais les variables non pertinentes entreraient dans les modèles de manière aléatoire. 
+
+L'objectif de la régression Lasso Bootstrap est alors de casser ce processus de probabilités de sélection non adapté à toutes les variables selon leur pertinence, en rééchantillonnant à partir du même ensemble de données unique. Le Lasso est alors exécuté pour plusieurs réplications bootstrap d'un échantillon donné, et l'intersection des supports des estimations faites sur ces échantillons bootstrappés conduit à une sélection cohérente du modèle. 
+
+
+
+### Application
+
+Son application n'a pas été évidente puisque de nombreuses fonctions existent pour traiter des problèmes avec BoLASSO mais les packages ne sont plus disponibles pour cette version de R (package "mht" par exemple), d'autres s'avèrent être pour des problèmes catégoriels (package "SparseLearner"), d'autres encore sont développés par des programmateurs et impliquent d'autres fonctions pas toujours accessibles (package "dmolitor/bolasso" ou "david26694/bolasso"). Finalement, c'est la libraire '*mhtboot*' que nous avons appelée, nous avons utilisé la fonction **mht.1sample()** qui implémente des tests d'hypothèses multiples basés sur la distribution bootstrap des p-values. Nous fixons le nombre de bootstrap à 100 et regardons les variables alors sélectionnées.
+
+```{r echo=TRUE}
+#install.packages("mhtboot")
+library(mhtboot)
+bolasso <- mht.1sample(x, B=100, ncpus=1)
+# on regarde les variables sélectionnées
+bolasso$signal
+```
+
+La régression LASSO bootstrappée retient 8 variables comme la méthode "SCAD". Par ailleurs les variables sélectionnées sont toutes différentes de cette dernière puisqu’il s’agit de Gold_Princing_Index, News_Based_Policy_Uncert_Index, Capacity_Utilization, GISS_Temperature, Industrial_Capacity, OECD_6NME_Industrial_Production, US_Ending_Stocks_Crude_Oil et VIX.
+
+
+<br>
+
+<br>
+
+## 3.4 Comparaison
+
+<br>
+
+```{r include=FALSE}
+#Récupérartion des variables selectionnées pour la création d'un tableau récapitulatif:
+
+#On met en data.frame les colonnes de beta de toute les méthodes:
+df1_beta <- cbind.data.frame(as.matrix(ridge_beta),as.matrix(lasso_beta),as.matrix(en_beta),as.matrix(alasso_beta),as.matrix(aen_beta),as.matrix(ascad_beta),as.matrix(msaen_beta),as.matrix(msascad_beta))
+colnames(df1_beta) <- c("Ridge","LASSO","Elastic_Net","AdapLASSO","AdapEN","AdapSCAD","MS_AdapEN","MS_AdapSCAD")
+df1_beta
+
+#quelques méthodes à rajouter :(pas les mêmes dim que les autres car intercept)
+df2_beta <- cbind.data.frame(as.matrix(wfusion_beta),as.matrix(bridge_beta),as.matrix(scad_beta))
+colnames(df2_beta) <- c("WF_LASSO","Bridge","SCAD")
+df2_beta <- df2_beta %>% slice(-1)
+#On fusionne :
+df_beta <- cbind(df1_beta,df2_beta)
+
+#Pour rajouté Gets c'est un peu plus compliquer rajoute Gets:
+gets_beta <- as.data.frame(gets_beta)
+gets_beta$variables <- rownames(gets_beta)
+df_beta$variables <- rownames(df_beta)
+str(df_beta)
+
+df_beta <- left_join(df_beta, gets_beta, by = "variables")
+
+# On réordonne 
+df_beta <- df_beta %>% select(12,13,1,2,3,9,10,11,everything())
+
+# On remplace les Na par des 0
+
+df_beta$gets_beta <- replace_na(df_beta$gets_beta,0)
+
+# On essaie de faire mieux
+df_beta[,-c(1,3)] <- floor(df_beta[,-c(1,3)])
+
+#On rajoute une ligne de conclusion:
+Total <- c("Total","9","toutes","1","5","7","3","7","2","5","16","5","15")
+df_beta_table <- rbind.data.frame(df_beta,Total)
+```
+
+
+```{r echo=FALSE}
+kbl(df_beta_table, format = "html") %>% kable_styling(bootstrap_options = "striped", full_width = F, position = "center")  %>% kable_paper() %>% scroll_box(width = "100%", height = "400px")
+
+```
+
+<br>
+
+La table ci-dessus nous informe des variables sélectionnées par chaque méthode ainsi que des coefficients estimés pour ces dernières, pour la méthode **GETS** le coefficient de la variable "US_Ending_Stocks_Crude_Oil" étant de 0.006 il a été arrondi à 0 mais nous la conserverons pour les estimations. Il en va de même pour les méthodes **WF_LASSO**, **Bridge** et enfin **SCAD**. On remarque :
+
+* "Global.Economic.Policy", "Geopolitical.Risk", "Gold_Princing_Index", "VIX", "Crude. Oil. Prices..Brent", "GEPU_current", "Industrial_Production", "M2", "Petroleum_and_other_liquids_stocks_US", "Taux_change_effectif_USD" et "US_Ending_Stocks_Crude_Oil" ne sont sélectionnées par aucune méthode appliquée dans notre étude (hors méthode Ridge évidemment). Elles représentent tout de même `r round(11/27*100,2)`% des variables explicatives.
+
+* "WTI", "News_Based_Policy_Uncert_Index", "world_trade..volume.", "Business_Tendency_Surveys", "Capacity_Utilization", "GISS_Temperature",  "OECD_6NME_Industrial_Production" et "Spread" sont sélectionnées seulement par 1 ou 2 méthodes parmi les 11 appliquées (toujours hors Rige). Cela représente `r round(8/27*100,2)` % de la base.
+
+* A contrario, les variables les plus souvent sélectionnées (au minimum 8 fois sur 11) sont les suivantes : "Indice_Kilian", "Three_Component_Index", "Consumer_Sentiment", "Trade_Weighted_USD" et "GEPU_ppp". La variable qui arrive "en tête de liste" est l’indice Kilian qui est sélectionné par les 11 méthodes différentes et qui, nous le rappelons, était la variable la plus importante d’après la régression CART. 
+
+
+Nos méthodes de classification avaient donc vu juste quant aux groupements, aux fortes corrélations entre les variables. Ainsi parmi les 5 variables que nous avions pu voir en groupe sur l’ACP (Global.Economic.Policy, GEPU_current, GEPU_ppp, News_Based_Policy_Uncert_Index et Three_Component_Index) on voit que seules 2 d’entre elles ont été retenues quand les autres ont été écartées par les méthodes de sélection ; on voit cela puisque les variables "Global.Economic.Policy", "GEPU_current" et "News_Based_Policy_Uncert_Index" n’ont pas ou très peu (moins de 3 fois) été retenues dans les différentes régressions. De la même manière, nous avions pu noter de fortes relations entre les variables suivantes : Trade_Weighted_USD, Gold_Princing_Index, Taux_change_effectif_USD et Crude.Oil.Prices..Brent. On voit cependant que seule cette première a été gardée dans les méthodes de sélection. 
+
+Parmi les variables les plus souvent sélectionnées, on peut constater que la corrélation entre les variables "GEPU_ppp" et "Three_Component_Index" est proche de 0.5, mais mise à part cette corrélation, les variables retenues par la plupart des méthodes ne présentent pas de patterns de dépendance avec d’autres variables. Nous pouvons ainsi, dans une dernière partie, estimer par régression linéaire différents modèles : un pour chaque méthode avec les variables sélectionnées qui seront mises comme régresseurs de Y - c’est-à-dire le Baltic Dry Index.
+
+<br>
+
+<br>
+
+# 4. Modèle de régression {.tabset}
+
+Nous voyons finalement toutes les estimations faites à partir des variables sélectionnées par les méthodes économétriques (GETS) et pénalisées (toutes les autres). 
+
+Chacun de ces modèles a été estimé sur la base propre composée de 142 observations et non 143, car en ajoutant le BDI lagué comme variable explicative nous avons perdu une observation supplémentaire. La première chose que l’on peut regarder pour chacun des modèles est la qualité d’ajustement ajustée ($R^2$) ainsi que les critères d’informations AIC et BIC. Ces mesures nous permettent de les comparer et de choisir ainsi les plus pertinents ; tel que le $R^2$ est maximisé et les critères sont minimisés. Le critère d’Akaike (AIC) mesure la qualité d’un modèle statistique tandis que le critère bayésien (BIC) en est dérivé et prend en compte la taille de l’échantillon (dans notre cas tous les modèles sont construits sur la même base donc nous prêterons surtout intérêt aux critères AIC et $R^2$). De même, nous considérons le $R^2$ ajusté et non le basique puisque celui-ci augmente à mesure que des variables explicatives sont intégrées aux modèles ; or il arrive que certaines n’améliorent pas réellement la qualité du modèle.
+
+<br>
+
+## Code des modèles 
+
+```{r echo=TRUE}
+# Estimation des modèles :-
+
+  #Modèle GETS:
+var_gets <- df_beta %>% select(1,2) %>% filter(gets_beta != 0) %>% select(1)
+
+mod_gets <- lm(Baltic.Dry.Index ~ lag(Baltic.Dry.Index) + Container.Index + CPI + Indice_Kilian + Consumer_Sentiment + GEPU_ppp + Industrial_Capacity + Trade_Weighted_USD + Three_Component_Index + US_Ending_Stocks_Crude_Oil, data = df_fret_clean)
+
+  #Modèle LASSO:
+var_lasso <- df_beta %>% select(1,4) %>% filter(LASSO != 0) %>% select(1)
+
+mod_lasso <- lm(Baltic.Dry.Index ~ lag(Baltic.Dry.Index) + Indice_Kilian, data = df_fret_clean)
+
+  #Modèle Elastic-Net:
+var_en <- df_beta %>% select(1,5) %>% filter(Elastic_Net!= 0) %>% select(1)
+
+mod_en <- lm(Baltic.Dry.Index ~ lag(Baltic.Dry.Index) + Indice_Kilian + Three_Component_Index + Consumer_Sentiment + GEPU_ppp + Trade_Weighted_USD, data = df_fret_clean)
+
+
+ #Modèle WF_LASSO
+
+var_wfusion <- df_beta %>% select(1,6) %>% filter(WF_LASSO != 0) %>% select(1)
+
+mod_wfusion <- lm(Baltic.Dry.Index ~ lag(Baltic.Dry.Index) + Indice_Kilian + Three_Component_Index + Consumer_Sentiment + GEPU_ppp + Petroleum_and_other_liquids_stocks_US + Trade_Weighted_USD + US_Ending_Stocks_Crude_Oil, data = df_fret_clean)
+
+
+ #Modèle Bridge
+
+var_bridge <- df_beta %>% select(1,7) %>% filter(Bridge != 0) %>% select(1)
+
+mod_bridge <- lm(Baltic.Dry.Index ~ lag(Baltic.Dry.Index) + WTI + Indice_Kilian + Trade_Weighted_USD, data = df_fret_clean)
+
+
+ #Modèle SCAD
+
+var_scad <- df_beta %>% select(1,8) %>% filter(SCAD != 0) %>% select(1)
+
+mod_scad <- lm(Baltic.Dry.Index ~ lag(Baltic.Dry.Index) + CPI + Indice_Kilian + Three_Component_Index + Consumer_Sentiment + GEPU_ppp + Trade_Weighted_USD + US_Ending_Stocks_Crude_Oil, data = df_fret_clean)
+
+
+  #Modèle AdapLASSO:
+var_alasso <- df_beta %>% select(1,9) %>% filter(AdapLASSO != 0) %>% select(1)
+
+mod_alasso <- lm(Baltic.Dry.Index ~ lag(Baltic.Dry.Index) + Indice_Kilian + Trade_Weighted_USD, data = df_fret_clean)
+
+
+  #Modèle AdapEN:
+var_aen <- df_beta %>% select(1,10) %>% filter(AdapEN != 0) %>% select(1)
+
+mod_aen <- lm(Baltic.Dry.Index ~ lag(Baltic.Dry.Index) + Indice_Kilian + Three_Component_Index + Consumer_Sentiment + GEPU_ppp + Trade_Weighted_USD, data = df_fret_clean)
+
+
+  #Modèle AdapSCAD:
+var_ascad <- df_beta %>% select(1,11) %>% filter(AdapSCAD != 0) %>% select(1)
+
+mod_ascad <- lm(Baltic.Dry.Index ~ lag(Baltic.Dry.Index) + Container.Index + WTI + CPI + Indice_Kilian + Three_Component_Index + News_Based_Policy_Uncert_Index + world.trade..volume. + Business_Tendency_Surveys + Capacity_Utilization + Consumer_Sentiment + GISS_Temperature + GEPU_ppp + Industrial_Capacity + OECD_6NME_Industrial_Production + Spread + Trade_Weighted_USD, data = df_fret_clean)
+
+
+
+ #Modèle MS_AdapEN
+
+var_msaen <- df_beta %>% select(1,12) %>% filter(MS_AdapEN != 0) %>% select(1)
+
+mod_msaen <- lm(Baltic.Dry.Index ~ lag(Baltic.Dry.Index) + Indice_Kilian + Three_Component_Index + Consumer_Sentiment + GEPU_ppp + Trade_Weighted_USD, data = df_fret_clean)
+
+
+
+ #Modèle MS_AdapSCAD   (seulement News_Based_Policy_Uncert_Index pas selectionné comparer à AdapSCAD)
+
+var_msascad <- df_beta %>% select(1,13) %>% filter(MS_AdapSCAD != 0) %>% select(1)
+
+mod_msascad <- lm(Baltic.Dry.Index ~ lag(Baltic.Dry.Index) + Container.Index + WTI + CPI + Indice_Kilian + Three_Component_Index + world.trade..volume. + Business_Tendency_Surveys + Capacity_Utilization + Consumer_Sentiment + GISS_Temperature + GEPU_ppp + Industrial_Capacity + OECD_6NME_Industrial_Production + Spread + Trade_Weighted_USD, data = df_fret_clean)
+ 
+ #Modèle BoLASSO 
+
+mod_bolasso <- lm(Baltic.Dry.Index ~ lag(Baltic.Dry.Index) + Gold_Princing_Index + News_Based_Policy_Uncert_Index + Capacity_Utilization + GISS_Temperature + Industrial_Capacity + OECD_6NME_Industrial_Production + US_Ending_Stocks_Crude_Oil + VIX, data = df_fret_clean)
+```
+
+## Tableau récapitulatif
+
+```{r echo=FALSE}
+#On résume tout dans un tableau récap des modèles :
+library(modelsummary)
+library(flextable)
+
+models <- list()
+
+models[['GETS']] <- mod_gets
+models[['LASSO']] <- mod_lasso
+models[['Elastic-Net']] <- mod_en
+models[['WF_LASSO']] <- mod_wfusion
+models[['Bridge']] <- mod_bridge
+models[['SCAD']] <- mod_scad
+models[['AdapLASSO']] <- mod_alasso
+models[['AdapEN']] <- mod_aen
+models[['AdapSCAD']] <- mod_ascad
+models[['MS_AdapEN']] <- mod_msaen
+models[['MS_AdapSCAD']] <- mod_msascad
+models[['BoLASSO']] <- mod_bolasso
+
+msummary(models, title = "Resultat des estimations", stars = TRUE, output = "flextable")
+```
+
+<br>
+
+On constate ainsi, à partir du tableau récapitulatif des modèles estimés, que la régression linéaire la plus optimale semble être celle où ont été incluses les variables retenues par la méthode GETS. La qualité d’ajustement est effectivement la plus élevée avec $R^2$=47.6%, l’AIC le plus faible (2166.4). Pour rappel ce modèle considérait les variables "Container.Index", "CPI", "Indice_Kilian", "Consumer_Sentiment", "GEPU_ppp", "Industrial_Capacity", "Trade_Weighted_USD", "Three_Component_Index", "US_Ending_Stocks_Crude_Oil" comme importantes dans l’explication du BDI. Par rapport aux autres méthodes de sélection de variables, la régression GETS avait l’avantage d'en considérer un plus grand nombre tout en restant parcimonieuse notamment en comparaison avec le LASSO qui n’en gardait qu’une seule ou bien l’adaptive SCAD qui en sélectionnait 16. Cependant nous devons vérifier les hypothèses sur les résidus avant de pouvoir conclure et interprêter les résultats.
+
+On peut aussi faire le constat que l’ajout de la variable à expliquer laguée en régresseur n’améliore pas les estimations puisque la variable n’est significative dans aucune des estimations exceptée l’AdaptSCAD au seuil de risque de 10% et le BoLASSO à 1%. Par ailleurs, le modèle le plus pertinent qui arrive en 2ème ‘position’ par les critères d’informations, de qualité et de vraisemblance, est le modèles SCAD.
+
+L’objectif de ce dossier était de tester différentes méthodes de sélection de variables étudiées en cours, mais aussi d’en chercher une en plus dont il fallait expliquer le fonctionnement avant de l’appliquer. C’est ce que nous avons fait pour la méthode du LASSO bootstrapé, mais nous avons montré comment son application était compliquée du fait des packages non valables pour notre version R studio, ni sur R, ou alors qui étaient prévus pour des natures de Y différentes de la nôtre. Aussi nous avons utilisé le package "mhtbooot" qui se rapprochait du package "mht" qui contenait la fonction bolasso() pour l’application de notre méthode. Cependant, au vu des variables sélectionnées qui ne correspondent à aucune autre sélection et au vu de la qualité d’ajustement de la régression linéaire comportant les 8 variables sélectionnées par BoLASSO, nous comprenons que le package ne doit pas implémenter exactement la fonction que nous recherchions. Par conséquent nous laissons cette méthode de côté et n’effectuerons même pas l’analyse des résidus sur le MCO correspondant. En revanche théoriquement cette méthode est pertinente et il serait intéressant de creuser son application en utilisant peut-être un autre logiciel d’analyse.
+
+Par ailleurs, nous voyons que les résultats sont identiques pour les modèles composés des variables retenues par les méthodes de sélection "Elastic-Net", "Adaptive EN" et "Multi-Step Adaptive EN", ce qui est logique puisque comme nous pouvons le constater, ces 3 méthodes ont sélectionné les mêmes régresseurs du BDI.
+
+Enfin, nous passons à l'analyse des résidus de chacun des modèles pour la validation de ceux-ci.
+
+
+## Analyse des résidus 
+
+Chaque modèle estimé par la méthode des moindres carrés ordinaires doit répondre à des critères spécifiques que nous décrivons ci-dessous, avant que le modèle puisse être validé et que des conclusions puissent être tirées.
+
+Le modèle doit être **bien spécifié**, c'est-à-dire qu'il existe une relation linéaire entre les variables, entre les paramètres et qu'il n'y a pas d'omission ou de redondance des variables. Le test Reset Ramsey nous permettra de vérifier si notre modèle est bien spécifié ou non. Il ne doit pas non plus y avoir de **multicollinéarité** parfaite entre les variables exogènes, en d'autres termes, le coefficient de corrélation simple entre deux variables explicatives doit être différent de l'unité. Nous le vérifierons avec le **Variance Inflation Factor**, VIF.
+
+Les dernières hypothèses concernent les perturbations aléatoires. Premièrement, les résidus doivent suivre une **distribution normale**. Ce qui peut être vérifié avec le test de Jarque-Bera mais ne doit être vérifié que lorsque l'échantillon comporte moins de 30 observations. Dans notre cas, nous avons 142 observations, il ne sera donc pas nécessaire de vérifier cette hypothèse. Deuxièmement, l'**homoscédasticité** des résidus doit être contrôlée c'est-à-dire que la variance du terme d'erreur doit rester constante pendant toute la période de l'échantillon. Plusieurs tests existent pour cette hypothèse, mais nous utiliserons ici le test de Breusch-Pagan. Si toutes ces conditions ne sont pas vérifiées, le modèle ne sera pas valide.
+
+```{r include=FALSE}
+library("questionr")
+library("outliers")
+library("EnvStats")
+library("lmtest")
+ 
+#Analyse de la bonne spécification:
+r_gets <- reset(mod_gets)
+pr_gets <- r_gets$p.value
+
+r_lasso <- reset(mod_lasso)
+pr_lasso <- r_lasso$p.value
+
+r_en <- reset(mod_en)
+pr_en <- r_en$p.value
+
+r_wfusion <- reset(mod_wfusion)
+pr_wfusion <- r_wfusion$p.value
+
+r_bridge <- reset(mod_bridge)
+pr_bridge <- r_bridge$p.value
+
+r_scad <- reset(mod_scad)
+pr_scad <- r_scad$p.value
+
+r_alasso <- reset(mod_alasso)
+pr_alasso <- r_alasso$p.value
+
+r_ascad <- reset(mod_ascad)
+pr_ascad <- r_ascad$p.value
+
+r_msascad <- reset(mod_msascad)
+pr_msascad <- r_msascad$p.value
+
+Reset_Test <- c(pr_gets, pr_lasso, pr_en, pr_wfusion, pr_bridge, pr_scad, pr_alasso, pr_ascad, pr_msascad)
+
+
+#Homocedasticité
+bp_gets <- bptest(mod_gets)
+pbp_gets <- bp_gets$p.value
+
+bp_lasso <- bptest(mod_lasso)
+pbp_lasso <- bp_lasso$p.value
+
+bp_en <- bptest(mod_en)
+pbp_en <- bp_en$p.value
+
+bp_wfusion <- bptest(mod_wfusion)
+pbp_wfusion <- bp_wfusion$p.value
+
+bp_bridge <- bptest(mod_bridge)
+pbp_bridge <- bp_bridge$p.value
+
+bp_scad <- bptest(mod_scad)
+pbp_scad <- bp_scad$p.value
+
+bp_alasso <- bptest(mod_alasso)
+pbp_alasso <- bp_alasso$p.value
+
+bp_ascad <- bptest(mod_ascad)
+pbp_ascad <- bp_ascad$p.value
+
+bp_msascad <- bptest(mod_msascad)
+pbp_msascad <- bp_msascad$p.value
+
+Breush_Pagan_Test <- c(pbp_gets, pbp_lasso, pbp_en, pbp_wfusion, pbp_bridge, pbp_scad, pbp_alasso, pbp_ascad, pbp_msascad)
+
+#Observation influentes
+ vif(mod_gets)
+ vif(mod_lasso)
+ vif(mod_en)
+ vif(mod_wfusion)
+ vif(mod_bridge)
+ vif(mod_scad)
+ vif(mod_alasso)
+ vif(mod_ascad)
+ vif(mod_msascad)
+ 
+ Vif_test <- c(1.548846, 1.423771, 1.456205, 1.486587, 1.565204, 1.529550, 1.453179, 26.544930, 2.569443)
+ 
+Conclusion <- c("X","Ok","Ok","X","Ok","X","Ok","X","X")
+ 
+#On regroupe les tests sur les résidus
+ df_res <- cbind.data.frame(Reset_Test,Breush_Pagan_Test, Vif_test, Conclusion)
+ 
+#On a fait la transposer 
+ df_res <- as.data.frame(t(df_res))
+
+#On renome les variable.
+ df_names <- df_beta %>% select(-c(1,3,10,12))
+ colnames(df_res) <- paste(colnames(df_names))
+```
+
+
+```{r echo=FALSE}
+kbl(df_res, align = "c") %>%
+  kable_classic(full_width = F)
+```
+
+
+<br>
+
+Les résultats des tests sur la validité des conditions d’un MCO apparaissent dans la table ci-dessus. Pour les 3 modèles avec les mêmes variables retenues par les méthodes de sélection de variables ("Elastic-Net", "Adaptive EN" et "Multi-Step Adaptive EN") nous ne procédons évidemment aux tests de vérification que pour un seul d'entre eux que nous laissons sous le nom de "Elastic-Net". 
+
+Concernant la forme fonctionnelle du modèle et comme évoqué précédemment, c’est le test de Ramsey qui nous informe de sa bonne spécification, il est basé sur les hypothèses suivantes :
+
+* $H_0$ : la forme fonctionnelle du modèle est linéaire
+
+* $H_1$ : la forme fonctionnelle du modèle n’est pas linéaire
+
+On voit ainsi que 4 modèles sur 9 valident cette hypothèse puisque la p-value associée au test Reset est supérieure au seuil de risque de 5%. Le modèle GETS qui paraissait le mieux d’un point de vue de la qualité d’ajustement ne valide pourtant pas cette hypothèse et a donc une forme fonctionnelle non linéaire. 
+
+Le test de Breusch-Pagan quant à lui, qui concerne l'homoscédasticité des résidus suit la règle de décision suivante :
+
+* $H_0$ : les résidus du modèle sont homoscédastiques
+* $H_1$ : les résidus du modèle sont hétéroscédastiques
+
+On constate cette fois que seuls les modèles avec les variables sélectionnées par le Multi-Step Adaptive SCAD et l’adaptive SCAD ont des résidus hétéroscédastiques. Tous les autres valident l’hypothèse fondamentale à l’acceptation d’un modèle de régression linéaire. 
+
+Enfin, la vérification de la multicolinéarité au sein des variables explicatives nous est donnée par  le critère du “Variance Inflation Factor” (VIF) qui, bien que ce ne soit pas un test, s’applique de la manière suivante :
+
+* si le VIF est supérieur à 10 alors il y a un problème de multicolinéarité
+
+Nous avons mis pour cette condition le VIF le plus élevé parmi les variables explicatives ; nous voyons que même la valeur la plus grande est loin d’atteindre le seuil critique de 10 où nous sommes contraints de retirer la variable sauf pour le modèle adaptive SCAD. Le vif le plus élevé est en effet de 26.54 correspondant à la variable "News_Based_Policy_Uncert_Index".
+
+Par conséquent, bien que le meilleur modèle en termes de qualité soit celui où ont été incluses les variables issues de la méthode de sélection GETS, nous voyons que le régression ne valide pas les hypothèses fondamentales de validité et ne peut donc pas être retenue. Ainsi, si l’on regarde le meilleur modèle après celui-ci (*i.e.* celui qui est le plus pertinent ; $R^2$, AIC, Log.Llh **et** qui valide toutes les hypothèses) on voit qu'il s'agit de celui où ont été incluses les variables sélectionnées par les méthodes "Elastic-Net", "Adaptive EN" et "Multi-Step Adaptive EN". Leur qualité d’ajustement est de 44.9% et leur critère Akaike de 2169.7.
+
+Nous pouvons donc interpréter les résultats de la régression linéaire prenant en compte les variables retenues par ces 3 méthodes. Attention cependant aux valeurs des coefficients car nous avons stationnarisé toutes nos variables, donc les coefficients apparents sont ceux des rentabilités. On voit que le modèle est composé de 6 variables explicatives dont 3 sont significatives au seuil de risque 5% et 2 le sont uniquement au seuil de 10%. 
+
+Ainsi, lorsque les rentabilités de l'indice Kilian augmentent d’une unité, les rentabilités du BDI vont augmenter elles aussi de 18.9 points. La variable qui a l’effet le plus grand sur Y est celle du commerce américain ("Trade_Weighted_USD") bien que, n’étant pas un indice boursier, nous ne pouvions interpréter sa valeur comme une rentabilité. Par ailleurs, il apparaît que lorsque les rentabilités du "Three Component Index" augmentent d’une unité celles de l’indice maritime diminuent de 3.68 points, au seuil de risque 10%. 
+
+Ainsi, l’application des méthodes de sélection de variables a été concluante sur notre base puisqu’elles ont permis la construction de modèles parcimonieux et explicites. Nous avons alors pu expliquer 44.9% des variations des rentabilités du Baltic Dry Index sur la période février 2017 - décembre 2018.
+
+<br>
+
+<br>
+
+# 5- Annexes
+
+<br>
+
+ * **Annexe n°1** : Graphiques des séries en niveau
+```{r, eval=TRUE, echo=FALSE, fig.height=9, fig.width=15}
+# Variables non stationnaires selon le test ADF en rouge et en bleu celles stationnaires selon ADF
+
+par(mfrow=c(4,4))
+plot(y=df_fret[,2], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,4], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,5], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,6], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,7], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,8], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,9], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,12], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,13], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,14], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,15], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,16], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,17], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,18], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,19], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,20], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+
+par(mfrow=c(4,3))
+plot(y=df_fret[,22], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,23], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,24], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,25], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,26], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,27], x=df_fret$Date, type="l", col="red", ylab = "Cours", xlab='Temps')
+
+plot(y=df_fret[,3], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,10], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,11], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,21], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,28], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret[,29], x=df_fret$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+```
+
+<br>
+
+ * **Annexe n°2** : Graphiques des séries transformées
+```{r eval=TRUE, echo=FALSE, fig.height=9, fig.width=15}
+par(mfrow=c(4,4))
+plot(y=df_fret_clean[,2], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,4], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,5], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,6], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,7], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,8], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,9], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,12], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,13], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,14], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,15], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,16], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,17], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,18], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,19], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,20], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+
+par(mfrow=c(4,3))
+plot(y=df_fret_clean[,22], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,23], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,24], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,25], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,26], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,27], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,3], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,10], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,11], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,21], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,28], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+plot(y=df_fret_clean[,29], x=df_fret_clean$Date, type="l", col="blue", ylab = "Cours", xlab='Temps')
+```
+
+<br>
+
+ * **Annexe n°3** : Distribution des variables brutes et transformées
+```{r include=FALSE}
+p <- plot_histogram(df_fret, ggtheme = theme_bw(),title = "Distribution des variables brutes")
+```
+
+```{r echo=FALSE, fig.height=6, fig.width=13}
+grid.arrange(arrangeGrob(grobs = p, ncol=2, nrow=1)) 
+```
+
+```{r include=FALSE}
+pp <- plot_histogram(df_fret_clean, ggtheme = theme_bw(), title = "Distribution des variables propres")
+```
+
+```{r echo=FALSE, fig.height=6, fig.width=13}
+grid.arrange(arrangeGrob(grobs =pp, ncol=2, nrow=1))
+```
+
+<br>
+
+ * **Annexe n°4** : Pourcentage de la variance expliquée par les axes, ACP
+```{r echo=FALSE, fig.width=7}
+fviz_eig(res.pca, addlabels = TRUE)
+#round(res.pca$var$contrib,2)
+#dimdesc(res.pca)
+```

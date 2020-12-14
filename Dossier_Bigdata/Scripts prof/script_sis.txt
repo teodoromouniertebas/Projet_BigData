@@ -1,0 +1,46 @@
+# Sure Independence Screening with SIS package
+
+library(SIS)
+library(readxl)
+library(tidyverse)
+
+dlbase <- read_excel("c:\\R\\data\\dlbase.xlsx", sheet = "dlbase")
+dlbase <- data.frame(dlbase) # sinon erreur pour la suite
+
+summary(dlbase)
+str(dlbase)
+
+training_dlbase <- dlbase
+data.frame(training_dlbase)
+
+# standardized y and x (centered and standardized)
+y <- data.frame(training_dlbase) %>%
+  select(WTI) %>%
+  scale(center = T, scale = F) %>%
+  as.matrix()
+
+x <- data.frame(training_dlbase) %>%
+  select(-WTI) %>% # on retire la variable à expliquer y
+  as.matrix()
+  
+mod01 <- SIS(x, y, family="gaussian", penalty="MCP", tune="cv", nfolds=10, nsis=100)
+
+# indices selected by only SIS
+var <- mod01$sis.ix0	
+show(var)
+
+# indices selected by (I)SIS with regularization step
+var2 <- mod01$ix		
+show(var2)
+
+# coefﬁcients of the ﬁnal model selected by (I)SIS
+coefvar2 <- mod01$coef.est	
+show(coefvar2)
+
+mod02 <- SIS(x, y)
+
+
+## penalty function
+# penalty="lasso"
+# penalty="SCAD"
+# penalty="MCP"

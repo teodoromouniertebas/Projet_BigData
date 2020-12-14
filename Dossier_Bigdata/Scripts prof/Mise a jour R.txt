@@ -1,0 +1,8 @@
+# Certains packages ne marche qu'avec la dernière version de R (3.6)
+# Mettre à jour la version de R sans réinstaller les anciens packages
+
+install.packages("installr")
+library(installr)
+
+updateR()
+
